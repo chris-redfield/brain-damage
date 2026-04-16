@@ -8,61 +8,61 @@
       "accuracy": 0.22
     },
     "anatomy": {
-      "correct": 36,
+      "correct": 32,
       "total": 135,
-      "accuracy": 0.2667
+      "accuracy": 0.237
     },
     "college_chemistry": {
-      "correct": 21,
+      "correct": 22,
       "total": 100,
-      "accuracy": 0.21
+      "accuracy": 0.22
     },
     "college_computer_science": {
-      "correct": 34,
+      "correct": 26,
       "total": 100,
-      "accuracy": 0.34
+      "accuracy": 0.26
     },
     "econometrics": {
-      "correct": 28,
+      "correct": 27,
       "total": 114,
-      "accuracy": 0.2456
+      "accuracy": 0.2368
     },
     "global_facts": {
-      "correct": 13,
+      "correct": 16,
       "total": 100,
-      "accuracy": 0.13
+      "accuracy": 0.16
     },
     "machine_learning": {
-      "correct": 36,
+      "correct": 35,
       "total": 112,
-      "accuracy": 0.3214
+      "accuracy": 0.3125
     },
     "moral_scenarios": {
-      "correct": 214,
+      "correct": 213,
       "total": 895,
-      "accuracy": 0.2391
+      "accuracy": 0.238
     },
     "professional_medicine": {
-      "correct": 53,
+      "correct": 50,
       "total": 272,
-      "accuracy": 0.1949
+      "accuracy": 0.1838
     },
     "us_foreign_policy": {
-      "correct": 34,
+      "correct": 35,
       "total": 100,
-      "accuracy": 0.34
+      "accuracy": 0.35
     }
   },
   "overall": {
-    "correct": 491,
+    "correct": 478,
     "total": 2028,
-    "accuracy": 0.2421
+    "accuracy": 0.2357
   },
   "meta": {
     "method": "actw",
     "prune_ratio": 0.1,
-    "tiles_pruned": 11416,
-    "tiles_total": 151632,
-    "eval_time_s": 91.8
+    "tiles_pruned": 2878,
+    "tiles_total": 37908,
+    "eval_time_s": 93.3
   }
 }

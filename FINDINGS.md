@@ -238,6 +238,32 @@ Tested smaller 64x64 tiles (4x more tiles per matrix: 151,632 vs 37,908).
 
 **Decision:** Revert to 128x128 tiles. Larger tiles (256x256) may also be worth testing, but 128x128 is the validated sweet spot.
 
+### Gradient-based (Taylor) importance scoring
+
+Added a third scoring method: `importance(tile) = Σ|w * ∂L/∂w|` — the first-order Taylor approximation of loss change from zeroing each tile. This captures weight magnitude, input activations, AND downstream loss sensitivity in a single metric.
+
+Cost: ~10.5 minutes for 1024 calibration samples (forward + backward), vs ~53s for actw (forward only). Uses ~6.8 GB VRAM (weights + gradients + saved activations for backward).
+
+### Three-way comparison: Frobenius vs ActW vs Gradient (128x128, 1024 cal, 50% cap)
+
+| Pruning | Frobenius | ActWeight | Gradient | Best |
+|---|---|---|---|---|
+| 10% | 22.7% | 23.6% | **27.3%** | Grad |
+| 20% | 23.2% | 22.9% | **28.3%** | Grad |
+| 30% | 24.5% | **28.1%** | 26.4% | ActW |
+| 50% | **26.3%** | 22.4% | 22.5% | Frob |
+
+**Gradient scoring is the new best at low pruning levels.** At 10% pruning, gradient preserves 27.3% accuracy (only -3.5pp from baseline) vs 23.6% for actw and 22.7% for Frobenius. At 20%, gradient hits **28.3%** — our new overall best result, only 2.5pp below baseline while pruning 11.4% of MLP tiles.
+
+The methods have different sweet spots:
+- **Gradient:** best at 10-20% (27.3%, 28.3%) — loss-aware scoring identifies the truly safe-to-remove tiles
+- **ActW:** best at 30% (28.1%) — activation patterns capture functional structure at moderate sparsity
+- **Frobenius:** best at 50% (26.3%) — but only because the cap overrides its bad decisions
+
+**New overall best: gradient at 20% target → 28.3% accuracy** (baseline 30.8%, effective sparsity 11.4%, only 2.5pp below baseline).
+
+Gradient scoring's advantage at low sparsity makes sense: when you're only removing 10-20% of tiles, the key is identifying the absolute safest tiles to remove. Gradient importance directly measures "how much would the loss change" — it answers exactly the right question. At higher sparsity (30-50%), even gradient scoring can't find enough truly expendable tiles in this tightly packed 1B model.
+
 ---
 
 ## 6. Pruning Scope: MLP only (attention excluded)
