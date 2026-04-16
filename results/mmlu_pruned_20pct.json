@@ -1,0 +1,67 @@
+{
+  "tag": "pruned_20pct",
+  "model": "google/gemma-3-1b-pt",
+  "subjects": {
+    "abstract_algebra": {
+      "correct": 22,
+      "total": 100,
+      "accuracy": 0.22
+    },
+    "anatomy": {
+      "correct": 32,
+      "total": 135,
+      "accuracy": 0.237
+    },
+    "college_chemistry": {
+      "correct": 21,
+      "total": 100,
+      "accuracy": 0.21
+    },
+    "college_computer_science": {
+      "correct": 26,
+      "total": 100,
+      "accuracy": 0.26
+    },
+    "econometrics": {
+      "correct": 23,
+      "total": 114,
+      "accuracy": 0.2018
+    },
+    "global_facts": {
+      "correct": 30,
+      "total": 100,
+      "accuracy": 0.3
+    },
+    "machine_learning": {
+      "correct": 35,
+      "total": 112,
+      "accuracy": 0.3125
+    },
+    "moral_scenarios": {
+      "correct": 243,
+      "total": 895,
+      "accuracy": 0.2715
+    },
+    "professional_medicine": {
+      "correct": 71,
+      "total": 272,
+      "accuracy": 0.261
+    },
+    "us_foreign_policy": {
+      "correct": 26,
+      "total": 100,
+      "accuracy": 0.26
+    }
+  },
+  "overall": {
+    "correct": 529,
+    "total": 2028,
+    "accuracy": 0.2608
+  },
+  "meta": {
+    "prune_ratio": 0.2,
+    "tiles_pruned": 6594,
+    "tiles_total": 37908,
+    "eval_time_s": 99.9
+  }
+}
