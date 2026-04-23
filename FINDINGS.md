@@ -871,3 +871,173 @@ All deltas are within ±1.3pp on a base that's already at random chance. **No cl
 - **F = layers 8-16 duplicated, MMLU 48.87%** (dense 48.67%, +0.20pp)
 - Circuit boundary: Taylor z-sum crosses above +2000 at layer 8, stays above through layer 16, drops sharply after.
 - Duplication adds ~zero VRAM (shared module references) — a pure compute trade.
+
+### The follow-up — F widening: the circuit boundary is *razor-sharp*
+
+After F [8, 16] landed as the only winning variant, we tested three widenings to probe how localized the circuit boundary really is:
+
+| Variant | Spec | MMLU | Δ vs dense |
+|---|---|---|---|
+| F | [8, 16] | 48.87% | **+0.20pp** |
+| **F_L widen left** | [7, 16] | **36.09%** | **−12.58pp** 💥 |
+| **F_R widen right** | [8, 17] | **39.74%** | **−8.93pp** 💥 |
+| **F_LR widen both** | [7, 17] | **34.42%** | **−14.25pp** 💥 |
+
+**One layer in either direction and MMLU collapses 9-14 points.** This is the sharpest experimental result in the notebook — the difference between a +0.20pp win and a −14.25pp disaster is *one layer of the 45 in the duplicated stack*.
+
+### Why the boundary is exact — the "distribution shift at the seam" mechanism
+
+The duplicated block is `[a..b] → [a..b]` — on the second pass, layer `a` receives layer `b`'s output instead of layer `a-1`'s output (which is what it was trained on). For F at [8, 16] this works because:
+
+1. Layer 8 was trained to receive **layer 7's output** (encoder output).
+2. Layer 16's output, after one pass through the circuit, **is also a circuit-output representation** — semantically similar to what layer 7 would hand to layer 8 *if* layer 7 also emitted "circuit-ready" hidden states. Layer 7's actual role (encoder) isn't that far from layer 16's post-circuit role in terms of the hidden-state distribution feeding layer 8.
+3. So layer 8 receives something it can process, and the circuit re-runs cleanly.
+
+Now F_L = [7, 16]:
+1. Layer 7 was trained to receive **layer 6's output** (mid-encoder).
+2. On the second pass, layer 7 receives **layer 16's output** — the end of the circuit. This is **far** out of distribution for layer 7 (encoders expect pre-encoding representations, not post-reasoning ones).
+3. Layer 7 corrupts the hidden state with garbage output, everything downstream sees garbage input, model score tanks.
+
+Symmetric argument for F_R = [8, 17]: layer 17 was trained to receive layer 16's output. On the second pass it receives its own already-processed output, then hands it to layer 18. Layer 18 expected layer 17's first-pass output (post-circuit transition state), gets second-pass output (doubly-processed post-circuit), distribution-shifts.
+
+### The precise reading of the Taylor importance chart
+
+Looking at per-layer Taylor z-sums around the boundary:
+
+- Layer 6: −2515
+- Layer 7: **−219** (encoder/circuit transition — near zero)
+- **Layer 8: +2255** (sharp jump; circuit entry)
+- ...peak at layer 11: +4821...
+- **Layer 16: +2317** (circuit exit)
+- Layer 17: +1597 (post-circuit decoder transition)
+- Layer 18: +697
+- Layer 19: −94 (start of mid-trough)
+
+The left boundary (layer 7 → 8) crosses **zero with a +2474 jump** in Taylor importance. The right boundary (layer 16 → 17) drops by 720 but stays positive. The **left boundary is sharper** — and matches the larger MMLU regression when crossed (F_L at −12.58pp vs F_R at −8.93pp).
+
+**Taylor importance is not just "roughly identifying circuits" — it's pinpointing the exact seam layer-by-layer.** This is a stronger finding than RYS's 72B result. RYS swept 3,240 configs empirically; here we derive the exact boundary from the importance map directly.
+
+### Retrofitting the earlier conclusion
+
+Previously I framed F's success as "capturing the full circuit." More precisely: **F succeeds because it captures the MINIMAL coherent unit.** Wider isn't better — wider is catastrophically worse, because extending the duplication range by even 1 layer introduces a seam at a functional transition, and the duplicated block feeds out-of-distribution hidden states to non-circuit layers.
+
+Also: variants D [10, 14] and E [9, 15] now have a cleaner explanation. They hurt because they cut the circuit *inside* the boundary (missing the entry or exit), not because they're "too narrow" in the abstract. The boundary-matching principle is what matters.
+
+### Implication for Phase 5 generalization
+
+For any model, the procedure is:
+
+1. Compute per-layer Taylor importance (sum of z-normalized tile scores across MLP matrices).
+2. Identify the **sign-transition boundaries**: where importance sharply crosses from negative/near-zero to strongly positive (circuit entry) and back down (circuit exit).
+3. Duplicate exactly that range — not wider, not narrower.
+
+Our [8, 16] on Qwen 2.5 3B is a specific instance of this. On a different model size or architecture, the boundary indices will differ, but the *procedure* to find them is deterministic from the importance map. That's a general result; our numbers are just one demonstration.
+
+### Takeaway for the project thesis, updated
+
+- The "one importance map, both directions" premise holds with a sharper statement than before. The same Taylor scoring that picks safe-to-prune tiles identifies the exact circuit boundaries for duplication.
+- F at +0.20pp is small in absolute terms, but the *mechanism* (razor-sharp boundary matching) is now validated beyond just hitting a wide-enough window. This isn't noise — the adjacent variants lose 9-14pp.
+- Notebook 7's combined F + pruning + LoRA test now has a cleaner theoretical motivation: F is not a lucky config, it's the one *correct* duplication for this model, and combining it with light pruning tests whether the "full RMP" idea delivers real compute-for-accuracy redistribution.
+
+---
+
+## 17. Correction: Section 16's F=[8, 16] claim was wrong — real F is [9, 34]
+
+**This section retracts and corrects the core claim of Section 16.** Discovered while debugging notebook 7.
+
+### What went wrong
+
+Section 16 repeatedly stated that variant F (`F_stitched_top9`) duplicates layers **[8, 16]**. That was **a misreading on my part**. The actual range computed by `stitched_top_n(layer_scores, 9)` is **[9, 34]** — a 26-layer duplication (62 total layers in the forward pass), spanning from the early circuit all the way through the late-positive "decoder" zone.
+
+Re-computing from the same per-layer Taylor z-sums we had all along:
+
+| Rank | Layer | Score |
+|---|---|---|
+| 1 | 11 | +4822 |
+| 2 | 13 | +4269 |
+| 3 | 10 | +4186 |
+| 4 | 14 | +3713 |
+| 5 | 12 | +3473 |
+| 6 | 9 | +3389 |
+| 7 | 15 | +3239 |
+| 8 | **33** | **+3039** |
+| 9 | **34** | **+2993** |
+| 10 | 35 | +2589 |
+| 11 | 16 | +2318 |
+| 12 | 8 | +2255 |
+
+Top-9 = {9, 10, 11, 12, 13, 14, 15, **33, 34**}. Layers 33 and 34 in the late-positive zone outscore layers 8 and 16 at the circuit edges. `stitched_top_n` returns `(min=9, max=34)`. The stitching pulls in the entire trough (layers 16-32) as "gap layers" inside the range.
+
+### Detection and reproduction
+
+While investigating an anomaly in notebook 7 (F-only eval gave 38.21% instead of the expected 48.87%), a diagnostic cell confirmed that notebook 7's hardcoded `F_RANGE = (8, 16)` was mechanically correct (identity checks, weight integrity, config sync all passed) but produced 38.21%. A fresh run of notebook 6 in the same session reproduced 48.87% for its F variant. Reading notebook 6's current variants-printing output revealed the true spec:
+
+```
+F_stitched_top9  range [9,34] (26 layers dup, 62 total)
+```
+
+Not [8, 16]. Notebook 7 was testing a completely different (and losing) configuration.
+
+### Implications for Section 16's analysis
+
+The following claims in Section 16 are **wrong or misattributed**:
+
+1. **"F duplicates layers 8-16 (9 layers)"** → actually duplicates layers 9-34 (26 layers, 62 total).
+2. **"F captures the full natural circuit boundary"** → F is not a circuit-sized duplication at all. It's a 72% model duplication that also happens to include the entire reasoning peak plus the decoder zone.
+3. **"Razor-sharp boundary — one layer in either direction collapses it (F_L, F_R, F_LR lost 9-14pp)"** → F_L [7, 16], F_R [8, 17], F_LR [7, 17] were **not** widenings of the winning F. They were narrow (~10-layer) windows around the wrong assumed center. They collapsed because they're narrow peak-zone windows, not because F's boundary is razor-sharp at [8, 16].
+4. **"Distribution shift at the seam" mechanism tied to layer 7→8 and layer 16→17**: the mechanism description is still theoretically plausible for *any* duplication's seams, but it was specifically tied to the wrong (8, 16) boundary. The real F has seams at layer 8→9 (entry, at the edge of the negative encoder zone) and layer 34→35 (exit, near the end of the stack). Those are different functional transitions than the ones Section 16 analyzed.
+5. **"F at +0.20pp confirms the RYS mechanism at 3B scale"** → needs substantial walk-back. +0.20pp over 2028 MMLU questions is ±4 questions, well within the ~±1.1pp standard-error noise floor. A 26-layer / 72%-of-the-model duplication being statistically indistinguishable from dense is **much less interesting** than "a tight 9-layer circuit duplication beats dense." The former approaches "run most of the model twice," which should trivially not hurt much by symmetry.
+
+### What the real data actually shows (restated honestly)
+
+| Config | Spec | Dup size | Total layers | MMLU | Δ vs dense |
+|---|---|---|---|---|---|
+| Dense | — | — | 36 | 48.67% | — |
+| A2 top-1 | [11] | 1 | 37 | 44.82% | −3.85pp |
+| B1 RYS-scaled | [20, 23] | 4 | 40 | 46.06% | −2.61pp |
+| C best-Taylor contiguous | [10, 13] | 4 | 40 | 43.29% | −5.38pp |
+| A1 top-3 scattered | [10, 11, 13] | 3 | 39 | 39.89% | −8.78pp |
+| D stitched top-5 | [10, 14] | 5 | 41 | 41.47% | −7.20pp |
+| E stitched top-7 | [9, 15] | 7 | 43 | 40.88% | −7.79pp |
+| F_L "widen left" | [7, 16] | 10 | 46 | 36.09% | −12.58pp |
+| F_R "widen right" | [8, 17] | 10 | 46 | 39.74% | −8.93pp |
+| F_LR "widen both" | [7, 17] | 11 | 47 | 34.42% | −14.25pp |
+| B2 wide middle | [18, 25] | 8 | 44 | 45.51% | −3.16pp |
+| G far-tail | [32, 35] | 4 | 40 | 45.12% | −3.55pp |
+| H trough | [1, 4] | 4 | 40 | 40.14% | −8.53pp |
+| I gap scatter | [4, 20, 32] | 3 | 39 | 40.88% | −7.79pp |
+| **F (real) stitched top-9** | **[9, 34]** | **26** | **62** | **48.87%** | **+0.20pp (noise)** |
+
+### Revised interpretation
+
+- **Every narrow duplication in the 1-11 layer range hurt by 2.6 to 14.3pp.** There is no narrow "circuit window" that helps. The block-size-cliff story in Section 16 (that 9 contiguous layers specifically beats 7) is wrong; 9 layers with a different span [8, 16] gives −10.46pp, not +0.20pp.
+- **Wide duplication (26 layers, 72% of stack) is approximately neutral.** +0.20pp is within noise. This makes physical sense: duplicating most of the model approaches "run the model twice," which preserves computation consistency.
+- **Phase 5 did not clearly succeed.** No duplication variant we tested beats dense with statistical significance. The pattern is: narrow duplications hurt; wide duplications are neutral. "Circuit targeting via Taylor importance" — the headline claim — is not supported by this data.
+
+### What the analysis got right
+
+The mechanism hypothesis — that duplicating a narrow window mid-stream feeds out-of-distribution hidden states to downstream layers and corrupts the computation — remains theoretically sound as an explanation for why narrow duplications hurt. What was wrong was claiming that a specific narrow window escapes this via "boundary matching." No narrow window in our sweep did.
+
+### Implications for notebook 7 and downstream work
+
+- **Notebook 7's `F_RANGE = (8, 16)` was testing a known-losing configuration** (−10.46pp vs dense). Any "F + pruning" or "F + pruning + LoRA" numbers computed from that range are measuring prune-damage plus F-damage, not the intended prune-plus-circuit-help.
+- **The correct `F_RANGE` to match notebook 6 is (9, 34)** — 26 layers duplicated, 62 total, approximately neutral on MMLU. That's what notebook 7 should use if we want the combo test to mean anything.
+- **But this also changes the motivation.** The combo test was framed as "prune for compute savings, duplicate for accuracy gain." With F giving only noise-level gain on dense, there's nothing to stack on top of pruning. F + pruning = mostly just pruning.
+
+### What I should have done
+
+Read the variants output cell every time and quoted the exact range, rather than manually interpreting the importance chart and assuming `stitched_top_n(9)` would return the contiguous peak I visually identified. The chart clearly showed layers 33-34 with scores above layers 8 and 16; I just didn't integrate that into my count of "top 9." Claiming a mechanism and a "razor-sharp boundary" on a misread range is the kind of mistake that would get published and then retracted.
+
+### Status of Phase 5
+
+**Not a clear success.** We confirmed:
+- Narrow local duplications destroy MMLU (consistent, 4-14pp regressions across 11 variants).
+- Wide duplications are approximately neutral.
+- RYS's position-scaling from 72B doesn't transfer straightforwardly to 3B (still valid).
+
+We did not confirm:
+- A targeted "circuit" duplication that beats dense with statistical significance.
+- The existence of a razor-sharp boundary effect.
+- The +0.20pp win (it's within noise).
+
+Phase 5 should be marked **attempted with negative result**, not ✅. The RMP full-combo test in notebook 7 is still worth running for pruning data but shouldn't expect a duplication-driven gain.

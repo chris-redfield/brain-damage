@@ -33,7 +33,7 @@ This 8 GB constraint shapes almost every decision — models above ~3B don't fit
 | 3 | `3.fused_mlp.ipynb` | Gemma 3 1B: partial MLP fusion (gate+up+silu in one kernel, down separate). Essentially no gain at 1B scale |
 | 4 | `4.fused_mlp_2b.ipynb` | Qwen 2.5 3B: activation-aware fused kernel + Taylor scoring + load-once architecture. **Main kernel results.** |
 | 5 | `5.lora_recovery.ipynb` | Qwen 2.5 3B Taylor-50% pruned: LoRA fine-tuning recovery attempts. Rank sweep + optimizer confound analysis. **Main recovery results.** |
-| 6 | `6.layer_duplication.ipynb` | Qwen 2.5 3B: RYS-style layer duplication. 11 variants comparing Taylor-ranked vs RYS-inspired vs stitched-top-N. **F (layers 8-16) beats dense baseline 48.87% vs 48.67%.** |
+| 6 | `6.layer_duplication.ipynb` | Qwen 2.5 3B: RYS-style layer duplication. 14 variants. **No narrow duplication beats dense.** Wide duplication (layers 9-34, 72% of stack) lands at 48.87% vs dense 48.67% — within noise (Phase 5 negative result). See FINDINGS §17. |
 
 ---
 
@@ -43,7 +43,7 @@ This 8 GB constraint shapes almost every decision — models above ~3B don't fit
 - ✅ **Phase 2** — Pruning strategy (global threshold + per-matrix cap, MLP only)
 - ✅ **Phase 3** — Custom sparse operator (bitmap kernel + hybrid dispatch + fused MLP kernel)
 - ✅ **Phase 4** — Evaluation (MMLU on 1B Gemma + 3B Qwen, kernel microbench + end-to-end latency)
-- ✅ **Phase 5** — Block duplication (RYS-style). F variant (layers 8-16 duplicated) beats dense baseline on MMLU. See Section 16 of FINDINGS.
+- ⚠️ **Phase 5** — Block duplication (RYS-style) attempted across 14 variants. **Negative result**: narrow duplications (1-11 layers) hurt MMLU by 3-14pp; wide duplication (layers 9-34, 72% of stack) is within noise of dense. Earlier "F=[8,16] beats dense by +0.20pp" claim was a misread — real F is [9,34]. See FINDINGS §17 for the correction.
 - ⚠️ **Phase 6** — LoRA recovery attempted; **blocked by VRAM** (see Sections 14–15 of FINDINGS). Stretch goals (whole-layer removal, quantization) untouched.
 
 ---
@@ -83,21 +83,28 @@ The accuracy story flipped going from 1B → 3B: Qwen's concentrated circuitry i
 
 Best attempted recovery: −0.69pp. Not a net win but pipeline works end-to-end on 8 GB.
 
-### Layer duplication (Qwen 2.5 3B, notebook 6)
+### Layer duplication (Qwen 2.5 3B, notebook 6) — Phase 5 negative result
 
-| Variant | Spec | MMLU | Δ vs dense (48.67%) |
-|---|---|---|---|
-| Dense baseline | — | 48.67% | — |
-| A1 top-3 scattered (Taylor peak) | [10, 11, 13] | 39.89% | −8.78pp |
-| C best-Taylor contiguous-4 | [10, 13] | 43.29% | −5.38pp |
-| B1 RYS-scaled window | [20, 23] | 46.06% | −2.61pp |
-| **F stitched top-9 (full peak)** | **[8, 16]** | **48.87%** | **+0.20pp** 🎉 |
+| Variant | Spec | Dup size | MMLU | Δ vs dense (48.67%) |
+|---|---|---|---|---|
+| Dense baseline | — | — | 48.67% | — |
+| A1 top-3 scattered (Taylor peak) | [10, 11, 13] | 3 | 39.89% | −8.78pp |
+| C best-Taylor contiguous-4 | [10, 13] | 4 | 43.29% | −5.38pp |
+| B1 RYS-scaled window | [20, 23] | 4 | 46.06% | −2.61pp |
+| [8, 16] (the one I mistakenly called "F") | — | 9 | 38.21% | −10.46pp |
+| F_L / F_R / F_LR widenings around [8, 16] | — | 10-11 | 34-40% | −9 to −14pp |
+| **F stitched top-9 (actual)** | **[9, 34]** | **26** | **48.87%** | **+0.20pp (within noise)** |
 
-**F is the first variant to beat the dense baseline on MMLU — Phase 5 win.**
+**No duplication variant beat dense with statistical significance.** +0.20pp over 2028 MMLU questions is ±4 questions — within the ~±1.1pp standard-error noise floor.
 
-Key finding: a sharp **block-size cliff** at 9 layers. Variants duplicating 1-7 layers of the peak circuit all hurt significantly (−4 to −9pp). Going to 9 contiguous layers flips the sign entirely, because it captures the *full natural boundary* of the reasoning circuit (Taylor z-sum goes above +2000 at layer 8, stays above through layer 16, drops sharply after). Partial circuit re-execution corrupts mid-stream hidden states; whole-circuit re-execution lets the model "think harder" as RYS predicted.
+Key observed pattern:
+- **Narrow duplications (1-11 layers) consistently hurt** by 3-14pp.
+- **Wide duplication (26 layers, 72% of the model) is approximately neutral** — which makes sense physically: duplicating most of the model approaches "run the model twice", preserving computation consistency by symmetry.
+- **No tight "circuit window" was found that beats dense.** The earlier claim of a "razor-sharp boundary at [8, 16] with +0.20pp" was a **misread** of the variants output (see FINDINGS §17 for the correction). The actual winning F was a 26-layer, 72%-of-stack duplication.
 
-Second finding: **RYS's relative position scaling does not transfer across model sizes.** RYS's 45-51 of 80 (center-back) would map to 20-23 of 36 — exactly the *trough* on our importance map. Smaller models concentrate circuits earlier. Data-driven circuit detection via Taylor importance is the method that generalizes.
+Still valid observation: **RYS's position scaling from 72B does not transfer to 3B straightforwardly.** Relative scaling of their 45-51 of 80 would put the window at 20-23 of 36 — in the trough of our Taylor importance map.
+
+What this means for the project thesis: the "duplicate critical circuits" half of the Taylor map's double-duty hasn't been demonstrated at this model size. Pruning half (prune dead weight) is well-validated; duplication half is an open negative result.
 
 ---
 
@@ -132,15 +139,16 @@ Ranking from best to worst (consistent across both model sizes):
 - This means: for max speed, run at 50% sparsity (same accuracy as 20% but 37% more speedup).
 - Smaller base models have a higher knee (Gemma 1B: signal preserved up to 30% sparsity). Stronger models have a lower knee (Qwen 3B: knee < 10%).
 
-### On layer duplication (notebook 6 — Phase 5)
+### On layer duplication (notebook 6 — Phase 5 negative result)
 
-- **Duplicating the full natural circuit boundary beats dense baseline.** F (layers 8-16) at +0.20pp on MMLU is small in absolute terms but confirms the RYS mechanism at 3B scale — the first variant to cross into positive territory after 10 negatives.
-- **Block-size cliff at the circuit boundary.** 1, 3, 4, 5, 7 layers of the peak all hurt (−4 to −9pp). 9 contiguous layers (exactly matching where Taylor z-sum is positive) helps. Partial re-execution of a circuit corrupts its internal hidden-state flow; whole-circuit re-execution works as RYS described.
-- **Taylor importance is doing double duty.** The same per-tile scoring that identifies safe-to-prune weights also identifies safe-to-duplicate layers via per-layer aggregation. That's the "one map, both directions" premise of the project validated on real numbers.
-- **RYS's relative-position scaling doesn't transfer.** Their 45-51 of 80 (center-back) would map to 20-23 of 36 on our Qwen 3B — exactly where importance is *negative*. Smaller models push reasoning circuits earlier in the stack. Data-driven boundary detection (via Taylor) is the generalizable method.
-- **"Low importance = safe to duplicate" is wrong.** Early negative-Taylor layers (H trough, 1-4) are not passthrough — they're doing heavy encoding work that every downstream layer depends on. Duplicating them corrupts early representations and tanks MMLU worse than duplicating the peak partially.
-- **Circuit corruption is a local failure mode.** Scattering duplications across zones (I) hurts as much as scattering within the peak (A1) — no spatial spread saves you from the mid-flow hidden-state corruption.
-- **Budget-neutral prune + duplicate didn't work at Taylor-50% pruning.** The pruned base is already at random chance; duplication added ±1pp noise. Light pruning (Taylor 10-20%) + F duplication is the right next test.
+- **No duplication variant we tested beats dense with statistical significance.** +0.20pp on F=[9, 34] is within the MMLU ±1.1pp noise floor. Phase 5 should be marked as an attempted experiment with a negative result, not a win.
+- **Narrow local duplications universally hurt** (3-14pp regressions across 13 variants with dup sizes from 1 to 11 layers). The mechanism is plausible: duplicating a narrow mid-stream block feeds out-of-distribution hidden states to downstream layers, corrupting computation. But this isn't validated as a *useful* result — it's just "narrow local duplication is bad."
+- **Wide duplication (26 layers, 72% of the stack) is approximately neutral.** This makes sense by symmetry — duplicating most of the model approaches "run the model twice" with consistent computation.
+- **RYS's relative-position scaling doesn't transfer.** Their 45-51 of 80 (center-back) would map to 20-23 of 36 on our Qwen 3B — exactly where importance is *negative*. Smaller models push reasoning circuits earlier in the stack. Still a valid observation.
+- **"Low importance = safe to duplicate" is wrong** (H trough [1, 4] at −8.53pp). Early negative-Taylor layers are doing heavy encoding work that downstream layers depend on, not being passthrough.
+- **Scattered duplications across zones hurt as much as scattered within the peak** (I gap vs A1) — scattering itself is the destructive pattern.
+- **Taylor "double duty" is NOT validated at the duplication end.** The importance map tells us what's safe to *prune* (well-validated). It does not, on this evidence, reliably tell us what's beneficial to *duplicate* at this model size.
+- **Methodological lesson.** An earlier version of FINDINGS Section 16 built a strong "razor-sharp boundary at [8, 16]" narrative and a "block-size cliff" story based on a misread of the variants-output cell. F was always range [9, 34], not [8, 16]. The adjacent "widening" variants (F_L, F_R, F_LR) weren't widening the winner — they were nearby narrow windows, and their collapse was the same pattern as every other narrow window in the sweep. Always read the variant spec from code/logs, not from chart interpretation.
 
 ### On LoRA recovery (new — notebook 5)
 
@@ -168,10 +176,10 @@ Ranking from best to worst (consistent across both model sizes):
 
 ### Local-feasible (what we can still do on 8 GB)
 
-1. **Widen/tune F further** — try [7, 17], [8, 17], [8, 18] (11 layers). Does including outer shoulders help more, or start to regress? Maps the circuit boundary precisely around the current +0.20pp win.
-2. **Triple-duplicate F** — run layers 8-16 *three* times in forward. RYS didn't test this. If "think harder" works once, does "think even harder" work twice?
-3. **F + light pruning** — Taylor 10-20% sparsity (above the accuracy knee) combined with F duplication. This is the real **full-RMP test**: prune dead weight for compute savings, duplicate circuit for accuracy gain, target budget-neutral or better end-to-end. The Taylor-50% + F test in notebook 6 was dominated by pruning damage (pruned base was at random chance); a lighter prune should preserve enough signal for F to show a real gain.
-4. **Sub-10% sparsity on Qwen (alone)** — below the accuracy knee. Less speedup but might preserve real signal. Worth measuring for a quality-focused operating point as a baseline for (3).
+1. **Sweep narrow duplication windows systematically** — all [start, end] pairs with end − start ∈ {3, 5, 7, 9} across the stack. The current evidence is that narrow duplications hurt everywhere we tested; but we only sampled ~10 configs. A more complete sweep would verify there's no hidden sweet spot RYS-style. Cheap: 3240 configs like RYS's sweep = too many; a 36×36/2 structured sweep = 648 configs × 90s = too long; but e.g. fixed-size-7 window across 30 positions = 30 evals × 90s = 45 min.
+2. **Sub-10% sparsity on Qwen** — below the accuracy knee. Less speedup but might preserve real signal. Worth measuring for a quality-focused operating point.
+3. **Pruning + LoRA recovery with pretraining distribution OR more data** — notebook 5's MMLU-aux approach didn't work. Try C4 streaming + next-token CE at r=16 with full-precision AdamW. (VRAM-constrained; maybe with MAX_LEN 96 it fits.)
+4. **Attention tile-pruning** (Phase 6 stretch) — currently excluded. Per-head analysis + MLP-style tile pruning within Q/K/V projections. Risky but unexplored.
 
 ### Stretch (Phase 6 remainder)
 
@@ -190,11 +198,11 @@ Ranking from best to worst (consistent across both model sizes):
 
 ## How to pick back up in the next session
 
-1. Read `FINDINGS.md` sections 9-13 for the kernel story, 14-15 for the LoRA story, 16 for the duplication story — or this doc for a summary
+1. Read `FINDINGS.md` sections 9-13 for the kernel story, 14-15 for the LoRA story, 16 for the initial (partially retracted) duplication story, **17 for the correction and Phase 5 negative result**. Or this doc for a summary.
 2. For kernel work / new pruning configs → open notebook 4 (`4.fused_mlp_2b.ipynb`)
 3. For recovery work / LoRA iteration → open notebook 5 (`5.lora_recovery.ipynb`)
-4. For RYS duplication / Phase 5 iteration → open notebook 6 (`6.layer_duplication.ipynb`) — F variant is the baseline to build on
-5. For the full-RMP combo experiment (light prune + F duplicate) → new notebook 7, reuse notebook 6's duplication utilities on a lighter-pruned base
+4. For RYS duplication / Phase 5 iteration → open notebook 6 (`6.layer_duplication.ipynb`). **Caveat**: the winning F variant is range [9, 34] (26-layer dup) and its +0.20pp is within noise — there is no validated narrow "circuit window" that beats dense.
+5. Notebook 7 (`7.rmp_full.ipynb`) exists but its original F=[8, 16] assumption was wrong. The `F_RANGE` constant has been corrected to (9, 34), matching notebook 6's real winning variant. Re-running it would sweep Taylor pruning levels with the 26-layer duplication applied — but given F is within noise, the test is effectively "pruning only" with extra compute overhead. Useful if you want the pruning-sweep data on Qwen 3B, not if you expect a duplication-driven gain.
 
 ---
 
@@ -207,11 +215,12 @@ Ranking from best to worst (consistent across both model sizes):
 ├── 3.fused_mlp.ipynb              # Partial fusion on 1B
 ├── 4.fused_mlp_2b.ipynb           # Full comparison on Qwen 3B — MAIN KERNEL RESULTS
 ├── 5.lora_recovery.ipynb          # LoRA recovery attempts on Qwen 3B — MAIN RECOVERY RESULTS
-├── 6.layer_duplication.ipynb      # RYS-style layer duplication — PHASE 5 RESULTS (F variant beats dense)
+├── 6.layer_duplication.ipynb      # RYS-style layer duplication — PHASE 5 (negative result, see FINDINGS §17)
+├── 7.rmp_full.ipynb               # Full RMP combo (prune + duplicate + LoRA); F_RANGE corrected to (9, 34)
 ├── config.py                       # Shared project config (model, tile size, etc.)
 ├── eval_mmlu.py                    # MMLU subset evaluator (10 subjects, 2028 Qs)
 ├── PLAN.md                         # Original project plan (phases 1-6)
-├── FINDINGS.md                     # Chronological findings (16 sections)
+├── FINDINGS.md                     # Chronological findings (17 sections; §17 corrects §16)
 ├── README.md                       # This file
 └── results/                        # JSON outputs from each MMLU eval
 ```
