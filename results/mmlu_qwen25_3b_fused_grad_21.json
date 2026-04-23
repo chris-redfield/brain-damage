@@ -1,0 +1,67 @@
+{
+  "tag": "qwen25_3b_fused_grad_21",
+  "model": "google/gemma-3-1b-it",
+  "subjects": {
+    "abstract_algebra": {
+      "correct": 23,
+      "total": 100,
+      "accuracy": 0.23
+    },
+    "anatomy": {
+      "correct": 37,
+      "total": 135,
+      "accuracy": 0.2741
+    },
+    "college_chemistry": {
+      "correct": 29,
+      "total": 100,
+      "accuracy": 0.29
+    },
+    "college_computer_science": {
+      "correct": 24,
+      "total": 100,
+      "accuracy": 0.24
+    },
+    "econometrics": {
+      "correct": 30,
+      "total": 114,
+      "accuracy": 0.2632
+    },
+    "global_facts": {
+      "correct": 18,
+      "total": 100,
+      "accuracy": 0.18
+    },
+    "machine_learning": {
+      "correct": 28,
+      "total": 112,
+      "accuracy": 0.25
+    },
+    "moral_scenarios": {
+      "correct": 244,
+      "total": 895,
+      "accuracy": 0.2726
+    },
+    "professional_medicine": {
+      "correct": 100,
+      "total": 272,
+      "accuracy": 0.3676
+    },
+    "us_foreign_policy": {
+      "correct": 24,
+      "total": 100,
+      "accuracy": 0.24
+    }
+  },
+  "overall": {
+    "correct": 557,
+    "total": 2028,
+    "accuracy": 0.2747
+  },
+  "meta": {
+    "model": "Qwen/Qwen2.5-3B-Instruct",
+    "variant": "fused_grad_21",
+    "scoring": "gradient_taylor",
+    "eval_time_s": 89.9
+  }
+}

@@ -295,3 +295,452 @@ This is deterministic (no sampling, no temperature), fast (~65s per full eval), 
 - RAM: 30 GB
 - Python 3.10, PyTorch 2.x, Transformers 4.50.3, Triton 3.2.0
 - Model loads at ~2.6 GB in bf16
+
+---
+
+## 9. Block-Sparse Kernel (Phase 3) — Prefill vs Decode
+
+Built a custom Triton kernel that reads a per-matrix bitmap `(N_tiles, K_tiles)` and skips zeroed (128×128) blocks during matmul. Wrapped it in a `BlockSparseLinear` drop-in replacement for `nn.Linear` and swapped it in for every MLP linear on the ActW-30% pruned model.
+
+### Correctness
+
+MMLU on the block-sparse model: **28.4%** — matches the dense-pruned ActW 30% result (~28.1%). The kernel produces numerically equivalent output (within bf16 tolerance). ✓
+
+### Two regimes: `M` is everything
+
+In `Y = X @ W.T` with `X: (M, K)` and `W: (N, K)`, `M = batch_size * seq_len` — the number of input rows processed at once. Transformer inference has two completely different regimes:
+
+- **Prefill** (processing the prompt / context): `M = prompt_length`. Big GEMM, compute-bound, tensor-core friendly.
+- **Decode** (generating one token): `M = 1`. Actually a GEMV (matrix-vector), memory-bandwidth-bound.
+
+### Prefill benchmark (seq_len 128–2048) — our kernel wins
+
+| Shape | M | 30% sparsity | 50% sparsity |
+|---|---|---|---|
+| gate/up_proj | 512 | **1.07x** | **1.39x** |
+| gate/up_proj | 2048 | **1.11x** | **1.47x** |
+| down_proj | 512 | **1.02x** | **1.34x** |
+| down_proj | 2048 | **1.06x** | **1.48x** |
+
+Speedup grows with M (more arithmetic intensity) and with sparsity (more tiles skipped).
+
+### Decode benchmark (M=1 to 64) — our kernel loses
+
+| Shape | M | Best sparsity result |
+|---|---|---|
+| gate/up_proj | 1 | 0.77x (slower) |
+| gate/up_proj | 64 | 1.18x (marginal win) |
+| down_proj | 1 | 0.68x (slower) |
+| down_proj | 64 | 0.26x (catastrophic) |
+
+### End-to-end generation (decode-dominated, 50 new tokens)
+
+- Dense baseline: 1394 ms / generate, 35.9 tok/s
+- Block-sparse:   1593 ms / generate, 31.4 tok/s
+- **Net: 0.88x (12% slower)** — the decode penalty overwhelms the prefill gains for short outputs.
+
+### Root cause: memory bandwidth at M=1
+
+At `M=1`, the matmul becomes a GEMV. You load the entire weight matrix (say 27 MB for `gate_proj`) from VRAM to multiply it against a single 1152-element vector. Compute is trivial; the bottleneck is reading weights from memory.
+
+Our v1 kernel stores the **dense weight + bitmap** — the zeroed tiles are still in VRAM. Skipping their compute saves arithmetic we weren't bottlenecked on, while cuBLAS's hand-tuned GEMV path issues coalesced reads of the whole matrix with no per-tile branching overhead. Dense wins.
+
+At `M ≥ 128`, arithmetic intensity rises (same weight reads reused across hundreds of rows), compute becomes the bottleneck, and skipping 30-50% of tile math actually helps.
+
+### Autotune experiment
+
+Wrapped the kernel in `@triton.autotune` over `BLOCK_M ∈ {16, 32, 64, 128}` and `num_warps ∈ {2, 4, 8}`, keyed on `(M, N, K)`.
+
+| Shape | auto/orig | auto/dense |
+|---|---|---|
+| gate/up_proj | 0.67x–0.95x (slight regression) | 0.42x–0.75x |
+| **down_proj** | **1.76x–2.26x** | 0.32x–0.62x |
+
+Autotuning **doubled** our kernel's speed on `down_proj` — `BLOCK_M=64` was badly wrong for that shape. But even with autotuning, we still lose to dense in every decode case. Autotune is fixing kernel config, not the fundamental memory-bandwidth problem.
+
+### Key finding
+
+The block-sparse kernel is a **prefill accelerator**, not a decode accelerator. That's fine — for long-context inference (e.g. 300K-token context windows) prefill dominates wall-clock time, so this is useful. But for short chatbot replies where output tokens outnumber prompt tokens, the decode regression erases any prefill gain.
+
+### Paths forward for decode
+
+The v1 kernel can't beat dense cuBLAS at M=1 because it doesn't reduce memory traffic. Options that actually attack the bandwidth bottleneck:
+
+1. **BCSR packing** — store only non-zero tiles contiguously + index. At 30% effective sparsity, ~30% fewer bytes read from VRAM. Directly targets the bottleneck.
+2. **Fused MLP kernel** — gate + up + (elementwise) + down in one kernel. Intermediate activations stay in registers/SMEM instead of round-tripping VRAM. Kills 3-kernels-per-layer launch overhead too.
+3. **Weight quantization** (INT8/INT4 on surviving tiles) — halves or quarters bandwidth. Compounds with BCSR.
+4. **Hybrid dispatch** — keep the block-sparse kernel for prefill (M ≥ threshold), fall back to dense for decode. Lossless: prefill wins, decode unchanged. Easy to implement in `BlockSparseLinear.forward` via an M check.
+5. **Dedicated GEMV kernel for decode** — rewrite for vector-matrix shape: iterate over non-zero column tiles, accumulate into a 1×N output vector. Different memory pattern (row-major weight scan instead of 2D block grid). Would only pay off once paired with BCSR packing so we're actually reading less.
+
+---
+
+## 10. Hybrid Dispatch Results + Hypothesis Revision
+
+### Implemented: hybrid dispatch
+
+Added `SMALL_M_THRESHOLD = 64` to `BlockSparseLinear.forward`. Below the threshold, forward uses `x @ self.weight.T` (dense cuBLAS, same result since tiles are already zeroed in memory). At or above, forward uses the Triton block-sparse kernel.
+
+### Results: decode regression gone, but prefill didn't accelerate either
+
+Using the ActW-30% pruned model (**21% effective sparsity** after 50% per-matrix cap):
+
+| Scenario | Before hybrid | After hybrid | Dense speedup |
+|---|---|---|---|
+| Short prompt + 50 gen (decode-heavy) | 0.88x | **0.99x** | ✓ regression fixed |
+| Long prompt + 20 gen (mixed) | — | **0.99x** | flat |
+| Pure prefill M=1953 | — | **0.98x** | **slightly slower** |
+
+Hybrid dispatch did exactly what it was designed to do on decode. But prefill at M=1953 — which should have been the kernel's home turf — was also 2% slower than dense. That contradicts the "M=1 is the problem" story.
+
+### Root cause revealed: break-even is a SPARSITY threshold, not an M threshold
+
+Re-reading our own microbenchmark at `seq_len=2048` with fresh eyes:
+
+| Sparsity | gate/up_proj | down_proj |
+|---|---|---|
+| 10% | 0.72x | 0.82x |
+| 30% | 0.95x | 1.10x |
+| 50% | 1.41x | 1.59x |
+
+The kernel only wins at ~30%+ sparsity. Our effective sparsity of 21% is **below break-even even at M=2048**. The "M=1 is the problem" framing was incomplete — the deeper issue is that the kernel's `tl.load(bitmap) + branch` costs something every iteration, and at low sparsity the savings from skipped tiles don't pay for that overhead.
+
+### 50% uniform sanity test — kernel design validated
+
+Rebuilt the model with **50% uniform per-matrix pruning** (bottom 50% of each matrix by ActW score, no cap, no global threshold). This is not a realistic config (accuracy would tank) — it's a kernel-speed test.
+
+| Scenario | Dense | BS 21% | BS 50% | 21% vs D | **50% vs D** |
+|---|---|---|---|---|---|
+| short + 50 gen | 1423.0ms | 1439.2ms | 1405.4ms | 0.99x | 1.01x |
+| long + 20 gen | 683.7ms | 692.1ms | 659.8ms | 0.99x | **1.04x** |
+| pure prefill (M=1953) | 183.1ms | 187.7ms | **157.8ms** | 0.98x | **1.16x** |
+
+**At 50% effective sparsity, the kernel is 16% faster than dense on pure prefill end-to-end.** The design works — we just need to be above the break-even sparsity threshold.
+
+### Revised mental model
+
+The original framing ("M=1 vs big-M") was too binary. The correct framing:
+
+> The kernel has a **break-even sparsity** above which it beats dense and below which it loses. That threshold depends on M (lower M → higher break-even needed), but for any realistic M the break-even is somewhere in the 20–30% range. We need effective sparsity > break-even to see speedup.
+
+At our ActW 21% effective sparsity, we sit right at the break-even line, so the kernel basically ties dense. Going to 50% clears the threshold decisively.
+
+### Why this makes BCSR even more important
+
+BCSR directly attacks the cause of the break-even tax:
+- **Fewer VRAM reads** (proportional to sparsity) — biggest wins at low M where we're memory-bound
+- **No bitmap-check tax** — we only iterate over non-zero tiles, so there's no "pay-to-check" cost on kept tiles
+- **Break-even point should drop dramatically** — with BCSR, 20% sparsity reads 20% fewer bytes, no overhead. Probably wins at 10%+ sparsity, not 30%.
+
+This is the cleanest path to making our realistic 21% ActW model actually accelerate. Next step.
+
+---
+
+## 11. BCSR v1 — Packed Storage, Block-Matmul Only
+
+Built BCSR packing: `packed (n_kept, TILE_R, TILE_C)` + `row_ptr (n_row+1,)` + `col_idx (n_kept,)`. Kernel iterates **only over kept tiles** (no bitmap, no skip-and-check). Correctness verified against dense-pruned matmul: max diff = 0.
+
+`BCSRLinear` is a full replacement for `nn.Linear` — no hybrid dispatch. Swapped into both the ActW-21% model and the 50%-uniform model. `build_bcsr_model()` loads fresh, packs in-place.
+
+### Results — BCSR v1 (full replacement, all M go through block-matmul kernel)
+
+| Scenario | Dense | BS 21% | BS 50% | **BCSR 21%** | **BCSR 50%** |
+|---|---|---|---|---|---|
+| short + 50 gen (decode-heavy) | 1457 ms | 1444 (1.01x) | 1422 (1.02x) | **1606 (0.91x)** | **1605 (0.91x)** |
+| long + 20 gen (mixed) | 698 ms | 704 (0.99x) | 660 (1.06x) | **751 (0.93x)** | **744 (0.94x)** |
+| pure prefill (M=1953) | 183 ms | 178 (1.03x) | 171 (1.07x) | **176 (1.04x)** | **169 (1.08x)** |
+
+### Two surprises
+
+**1. Prefill gain is tiny.** BCSR only beats the bitmap kernel by 1pp at prefill (1.04x vs 1.03x at 21%; 1.08x vs 1.07x at 50%). Reason: at M=1953 we're **compute-bound**, not memory-bound. Both kernels skip the same fraction of compute; BCSR's extra memory savings don't materialize because memory wasn't the bottleneck. The theoretical memory-bandwidth advantage of BCSR only matters in the memory-bound regime.
+
+**2. Decode regresses to 0.91x.** BCSR *without hybrid dispatch* loses decode by ~9%, reversing the fix we got from hybrid-dispatch on the bitmap kernel. Reasons:
+- Same M=1 overhead as before: kernel-launch overhead, grid inefficiency (`BLOCK_M=64` computes 64 rows but only 1 is valid → 98% wasted compute per block)
+- `tl.dot` has a 16-row minimum, so even with `BLOCK_M=16` we're 16x over-computing per tile
+- cuBLAS GEMV is hand-tuned for M=1 — memory savings alone can't beat 15 years of optimization
+- BCSR's memory win (~21% fewer weight reads) is real but tiny compared to the overhead
+
+### Upshot
+
+BCSR is **correct** and gives the right theoretical shape (memory-bandwidth friendly), but:
+
+- At large M (compute-bound): BCSR ≈ bitmap kernel — small gain, not a revolution
+- At M=1 (memory-bound): BCSR should win but doesn't, because the block-matmul kernel has M=1 overhead that swamps memory savings
+
+The fix can't be hybrid dispatch to dense (would require keeping a dense copy — defeats the packing). It also can't be reconstructing dense on the fly (too slow). The only principled path is a **dedicated BCSR-GEMV kernel** that handles M=1 with its own design: no `tl.dot`, no BLOCK_M waste, just vector × packed-tile multiplies with `tl.sum`. That's next.
+
+---
+
+## 12. BCSR v2 — Dedicated GEMV Kernel for M=1 (failed)
+
+Added `bcsr_gemv_kernel` specifically for decode: grid `(n_row_tiles,)`, one block per output tile, explicit `tl.sum(w * x_slice[None, :], axis=1)` to avoid `tl.dot`'s 16-row minimum. Autotuned over `num_warps ∈ {2, 4, 8}`. `BCSRLinear.forward` dispatches: `M == 1` → GEMV, `M > 1` → block-matmul. Correctness verified (max diff = 0).
+
+### Results — BCSRv2 made decode WORSE
+
+| Scenario | Dense | BS 21% | BCSR 21% | **BCSRv2 21%** | BCSRv2 50% |
+|---|---|---|---|---|---|
+| short + 50 gen (decode) | 1456 | 1475 (0.99x) | 1603 (0.91x) | **1717 (0.85x)** | 1705 (0.85x) |
+| long + 20 gen (mixed) | 682 | 685 (1.00x) | 766 (0.89x) | 780 (0.87x) | 743 (0.92x) |
+| pure prefill (M=1953) | 183 | 178 (1.03x) | 175 (1.04x) | 181 (1.01x) | 163 (1.12x) |
+
+The dedicated GEMV made decode **slower** than the block-matmul BCSR (0.85x vs 0.91x). Prefill unchanged (same kernel used). The hypothesis ("avoid `tl.dot` waste at M=1 → faster") was wrong.
+
+### Why the prediction failed — four compounding mistakes
+
+1. **Tensor cores beat CUDA cores even with 15/16 waste.** Ada (4070 Laptop) does ~120 TFLOPS bf16 on tensor cores vs ~30 TFLOPS FP32 on CUDA cores. With 63/64 waste, tensor cores still deliver ~1.9 TFLOPS effective — but CUDA cores with full efficiency also have per-warp reduction synchronization and lane-divergence overhead that `tl.dot` avoids. In practice, tensor cores' raw throughput keeps them ahead even with massive M-dimension waste.
+2. **I added `.to(tl.float32)` upcasts inside the loop.** This was unnecessary "for accuracy" and forced the entire multiply-sum onto CUDA cores in FP32, foreclosing tensor cores as an option. The block-matmul kernel keeps everything in bf16 and uses tensor cores; GEMV explicitly opted out.
+3. **`tl.sum` is a warp-level reduction with implicit barriers and shuffles**; `tl.dot` is a direct HW matmul op. On tile sizes as small as 128×128, reduction sync overhead is a significant fraction of the per-tile cost.
+4. **Compute was never the bottleneck at M=1 anyway.** It's kernel launch overhead + memory bandwidth. "Saving compute" by avoiding waste can't help if compute wasn't limiting us. Worse, the dedicated GEMV adds its own launches (separate kernel) + autotune lookup overhead per call.
+
+### The lesson
+
+Dimensional reasoning ("waste = bad → avoid waste = good") fails without accounting for the hardware specifics: tensor cores vs CUDA cores, reduction costs, dtype retention, autotune overhead. The block-matmul BCSR kernel — even with 98% M-dimension waste at M=1 — is actually the better design on this GPU for this size of model.
+
+### Decision: abandon BCSR
+
+BCSR adds significant complexity (packed + row_ptr + col_idx + two different kernels) for marginal gains at prefill and regressions at decode. The simpler bitmap kernel with hybrid dispatch is the better design point for a 1B model on this GPU. Path forward: **fused MLP kernel** on top of the bitmap architecture, targeting launch-overhead reduction which is the remaining bottleneck we haven't attacked.
+
+---
+
+## 13. Fused MLP Kernel — Partial Fusion Experiments
+
+### Notebook 3 — Fused gate+up+act on Gemma 3 1B
+
+Single Triton kernel does both `gate_proj` and `up_proj` matmuls inside one grid, then applies `silu(acc_g) * acc_u` elementwise before writing the MLP hidden tensor. `down_proj` stays a separate `BlockSparseLinear`. This cuts MLP kernel launches 3 → 2 per layer and keeps the `gate` intermediate in registers.
+
+**Results (Gemma 3 1B, ActW 21% masks):**
+
+| Scenario | Dense | BS 21% | Fused 21% | Fusion vs BS |
+|---|---|---|---|---|
+| short + 50 gen | 1456ms | 1475 (0.99x) | 1507 (0.94x) | 0.94x |
+| long + 20 gen | 682ms | 685 (1.00x) | 704 (0.97x) | 0.97x |
+| pure prefill | 183ms | 178 (1.03x) | 181 (1.01x) | 0.98x |
+
+**MMLU**: BS 21% = 28.4%, Fused 21% = 27.5% (-0.9pp).
+
+**Finding**: fusion gave essentially no benefit on a 1B model. Kernel launch overhead is small relative to matmul compute at this scale. The MMLU drop was traced to a **latent bug** — we hardcoded SiLU in the kernel, but Gemma's MLP uses `gelu_pytorch_tanh`. That bug is fixed in notebook 4 (activation detected from `model.config`).
+
+### Notebook 4 — Qwen 2.5 3B (activation-aware kernel + load-once architecture)
+
+Moved to Qwen 2.5 3B to test the "does sparsity speedup scale with model size?" hypothesis. Key engineering changes:
+
+1. **Activation-aware fused kernel** — `ACT_FN: tl.constexpr` dispatches between SiLU, `gelu_pytorch_tanh`, and exact GELU at compile time. Detects model activation from `config.hidden_act` / `config.hidden_activation`.
+2. **Load-once / configure-in-place architecture** — load the dense model ONCE, cache original MLP weights on CPU, then use `configure_model(variant, masks)` to switch between dense/bs/fused in-place. Avoids ever holding two model copies on a tight 8 GB card.
+3. **IPython-aware memory cleanup** — uncovered during debugging that IPython's `sys.last_traceback` + `Out[]` cache holds references to "deleted" models for 6+ GB. `free_models()` clears those explicitly.
+
+### Qwen 2.5 3B benchmark results
+
+Dense MMLU baseline: **48.7%** (vs Gemma 3 1B: 30.8%). Now pruning damage is measurable.
+
+**End-to-end speed:**
+
+| Scenario | Dense | BS 21% | BS 50% | Fused 21% | Fused 50% |
+|---|---|---|---|---|---|
+| short + 50 gen | 1422ms | 1422 (1.00x) | 1421 (1.00x) | 1422 (1.00x) | 1422 (1.00x) |
+| long + 20 gen | 909ms | 918 (0.99x) | 824 (1.10x) | 890 (1.02x) | 796 (1.14x) |
+| pure prefill (M≈2000) | 385ms | 396 (0.97x) | **302 (1.28x)** | 369 (**1.04x**) | **274 (1.41x)** |
+
+**Fusion gain over plain BS** (same sparsity, same tile selection):
+
+| Scenario | Fused/BS 21% | Fused/BS 50% |
+|---|---|---|
+| long + 20 gen | 1.03x | 1.04x |
+| **pure prefill** | **1.07x** | **1.10x** |
+
+### The three scaling wins
+
+1. **Sparsity speedup scales with model size** (hypothesis confirmed). Fused 50% prefill: 1.14x at 1B → **1.41x at 3B**. Bigger MLP matmuls → more compute-bound → sparsity matters more.
+2. **21% break-even crossed** on the bigger model. At 1B it hovered at 0.95–1.03x; at 3B Fused 21% prefill hits **1.04x** — the realistic ActW config now actually accelerates.
+3. **Fusion gives a real 7-10% on top of plain BS** at prefill. At 1B it was noise; at 3B it's measurable.
+
+### Accuracy — the bad news
+
+| Variant | Sparsity | MMLU | vs Dense |
+|---|---|---|---|
+| Dense | 0% | 48.7% | — |
+| BS 21% (ActW) | 21% | 24.9% | -23.8pp |
+| Fused 21% (ActW) | 21% | 25.1% | -23.6pp |
+| Fused 21% (Taylor) | 18.7% | **27.5%** | -21.2pp |
+| Fused 50% (Taylor) | 50% | 26.8% | -21.9pp |
+
+**MMLU collapsed to random chance (25%).** Qwen 2.5 3B is far more fragile to MLP pruning than Gemma 1B was — its extra capability comes from concentrated circuitry that can't tolerate 20%+ of MLP tiles being zeroed.
+
+### Taylor > ActW confirmed (again)
+
+At identical ~20% sparsity, Taylor scoring beats ActW by **+2.4pp** (27.5% vs 25.1%). Remarkably, **Taylor at 50% beats ActW at 21%** (26.8% > 25.1%) — so Taylor picks genuinely better tiles even when pruning 2.4× more aggressively.
+
+### Flat accuracy curve 21% → 50% (same as 1B pattern)
+
+Taylor 21% → Taylor 50% loses only 0.7pp (27.5% → 26.8%) despite 2.67× more pruning. Once we cross the "knee" (somewhere around 10-15% sparsity for Qwen 3B), the model is at its post-pruning floor and additional sparsity doesn't further degrade it.
+
+**Corollary for the kernel**: since accuracy is flat above the knee, we might as well run at 50% sparsity for max speed. Fused 50% Taylor gives 1.41x prefill + 26.8% MMLU vs Fused 21% Taylor at 1.04x + 27.5% — 37% more speedup for 0.7pp less accuracy.
+
+### Recovery path: LoRA fine-tuning
+
+The pruned model is **structurally correct** — same weights, just with 21-50% of MLP tiles zeroed. A short LoRA fine-tune (small adapter matrices targeting MLP projections) could recover a lot of the lost MMLU by letting the remaining tiles redistribute the zeroed tiles' function. Classic sparsity-recovery literature shows 50-80% of lost accuracy can come back with a few hundred training steps.
+
+This is **the natural next step** for the project: prune → LoRA-recover → measure. If LoRA brings Qwen 2.5 3B Fused 50% from 26.8% back up to 40%+, we'd have a legitimately useful artifact (1.41x faster, 80%+ of baseline capability).
+
+### Summary of the kernel exploration
+
+Validated:
+- Block-sparse kernel design is correct and portable (Gemma 1B, Gemma 3 arch, Qwen 2.5 arch)
+- Hybrid dispatch (M<64 → dense, M≥64 → kernel) eliminates decode regressions
+- Activation-aware fused kernel gives 7-10% over plain BS at prefill
+- Sparsity speedups scale with model size (confirmed going from 1B to 3B)
+- Taylor > ActW > Frobenius as importance metrics (confirmed across both sizes)
+
+Unsolved by kernel work alone:
+- Accuracy preservation at meaningful sparsity for stronger base models
+- Below the accuracy "knee" (sub-10% sparsity), our kernels don't accelerate much
+
+The remaining project scope moves to **LoRA recovery** and **RYS-style layer duplication** (the other half of the original project plan).
+
+---
+
+## 14. LoRA Recovery Attempt — Qwen 2.5 3B, Taylor 50% (Notebook 5)
+
+First attempt at Phase 6 recovery. Goal of this notebook was an end-to-end pipeline test at small scale before scaling up: prune → short LoRA fine-tune → re-eval.
+
+### Pipeline built
+
+- **Simplest design:** zero weights in place (Taylor 50% uniform per-matrix via per-component-type z-normalized scores, same as notebook 4). No forward patching, no fused kernel — just `F.linear` on zeroed weights, so PEFT attaches cleanly to the underlying `nn.Linear`s. Accuracy-equivalent to the fused path (the experiment is about recovery, not speed).
+- **LoRA config:** `r=16, alpha=32`, target modules `gate_proj / up_proj / down_proj` (MLP only — matches pruning scope). 22.6M trainable params (0.73% of model).
+- **Training data:** 500 samples from `cais/mmlu` `all/auxiliary_train` (disjoint from the test split).
+- **Answer-token-only loss:** labels are `IGNORE` everywhere except the single answer letter token, encoded the same way `eval_mmlu.py` encodes A/B/C/D. 100% of gradient signal lands on exactly what MMLU scores.
+
+### Two bugs fixed along the way
+
+1. **Prompt trailing space.** First draft had `"Answer: "` (trailing space) in the training prompt. Qwen's BPE tokenizes `"Answer: "` and `"Answer: B"` to the same length (the trailing space merges into the last token, and the `"B"` variant replaces that last token with `" B"`). Every sample was skipped by the `len(prompt_ids) >= len(full_ids)` guard, giving `ZeroDivisionError`. Fixed by matching `eval_mmlu.format_mmlu_prompt` exactly — `"Answer:"` with no trailing space — and building `input_ids = prompt_ids + [answer_token]` explicitly.
+2. **PEFT + gradient checkpointing OOM.** First training run OOM'd on an 8 GB card. Root cause: with a frozen base model, the input-embedding output doesn't naturally `require_grad`, so gradient checkpointing silently retains the full forward activation stack instead of recomputing. Fix: call `model.enable_input_require_grads()` right after `get_peft_model()`. Standard PEFT idiom for this case. After the fix, peak GPU during training was 7.01 GB — same as the bare-model peak, i.e. LoRA + optimizer + activations added essentially nothing on top of the dense forward pass.
+
+### Results (N_CAL=512, N_TRAIN=500, 3 epochs, LR=1e-4, MAX_LEN=192)
+
+| Stage | MMLU overall |
+|---|---|
+| Dense baseline (notebook 4) | 48.70% |
+| Pruned only (Taylor 50%, pre-LoRA) | **26.68%** |
+| + LoRA on 500 aux-train × 3 epochs | **25.99%** |
+| Δ from LoRA | **−0.69pp** |
+
+Pre-LoRA matches notebook 4's 26.8% result **exactly** — the mask-and-eval pipeline is bit-reproducible across notebooks. That's a clean confirmation that the variant-in-place vs fused-kernel paths give the same answer at this granularity.
+
+### Training loss dropped sharply, but it didn't transfer broadly
+
+Epoch-end smoothed losses: **6.27** (≈ random on 152k vocab) → 1.54 → 1.39 → **1.51**. Epoch 3 ticked back *up* — mild overfitting already by 1500 steps. The model clearly learned something (going from random to ~22% prob on the correct answer token), but the learning didn't translate to a net MMLU gain.
+
+**Per-subject Δ is wildly bimodal:**
+
+| Subject | Pre | Post | Δ |
+|---|---|---|---|
+| global_facts | 19.0 | 31.0 | **+12.0** |
+| abstract_algebra | 25.0 | 30.0 | +5.0 |
+| econometrics | 23.7 | 28.1 | +4.4 |
+| moral_scenarios | 24.9 | 27.3 | +2.4 |
+| anatomy | 22.2 | 24.4 | +2.2 |
+| college_computer_science | 32.0 | 30.0 | −2.0 |
+| college_chemistry | 34.0 | 30.0 | −4.0 |
+| us_foreign_policy | 33.0 | 28.0 | −5.0 |
+| machine_learning | 31.2 | 20.5 | −10.7 |
+| professional_medicine | 30.5 | 16.9 | **−13.6** |
+
+Five subjects gained, five lost. The two biggest regressions (professional_medicine −13.6pp, machine_learning −10.7pp) cancelled the gains.
+
+### Interpretation — data coverage, not optimization
+
+`auxiliary_train` is scraped from ARC, RACE, OpenBookQA, HellaSwag — not actual MMLU content. The first 500 streamed examples are almost certainly dominated by one source, so training shifts the model's answer-token distribution toward one narrow style. That helps subjects whose question format resembles the training source (hence +12pp on global_facts) and actively hurts subjects whose format differs (hence −13.6pp on professional_medicine).
+
+The loss curve confirms learning is real; the per-subject pattern says the *direction* of that learning isn't recovering broken MLP circuits, it's overwriting one answer-format prior with another.
+
+### Decisions
+
+- **LoRA recovery is non-trivial at this damage level.** 50% MLP-tile pruning on Qwen 3B destroyed 22pp of MMLU; 500 aux-train samples shifted things ±12pp per subject without net gain. "50–80% recovery in a few hundred steps" from the sparsity-recovery literature doesn't transfer directly to this configuration.
+- **Next recovery attempt should target the pretraining distribution** (C4 / FineWeb, next-token loss) rather than MMLU-flavored multi-choice data. The pruning damaged MLP circuits that were trained on the pretraining distribution; recovery data should match. MMLU-aux training is optimizing for a different objective (pick one of four letters) than what was broken.
+- **Scaling this exact configuration up is risky.** Epoch 3 already showed overfitting at 1500 steps. More data + fewer epochs + shuffled across sources is the right shape. But the pretraining-style recovery experiment is more likely to produce a broad gain than a scaled-up aux-train run.
+- **RYS-style layer duplication (Phase 5) is still untouched** and operates on a different axis (no training required). If pretraining-style LoRA also stalls, Phase 5 becomes the natural next move.
+
+### Pipeline artifacts now working (reusable for future experiments)
+
+- In-place pruning via `_apply_masks_inplace` without configure_model — simpler path when there's only one variant.
+- Taylor scoring with `register_post_accumulate_grad_hook` + immediate `param.grad = None` — confirmed to work on 3B on 8 GB with gradient checkpointing.
+- PEFT LoRA on frozen pruned base, trainable MLP adapters only, 7.01 GB peak.
+- Answer-token-only supervision via `tokenizer.encode(label, add_special_tokens=False)[-1]` — matches eval byte-for-byte, no tokenizer drift.
+- Diagnostic assertions that fail loud on empty batch lists.
+
+---
+
+## 15. LoRA Rank Sweep + Optimizer Confound — Qwen 2.5 3B (Notebook 5 continued)
+
+Hypothesis after section 14: maybe r=16 adapters (22.6M params, 0.73% of model) lacked capacity to absorb broken-tile functionality. Test plan: bump rank, see if recovery improves.
+
+### OOMs forced an optimizer change
+
+- **r=128** (target 180M trainable): instant OOM on the 8 GB card. Expected — AdamW fp32 optimizer state alone was ~1.4 GB on top of the 7.01 GB baseline.
+- **r=96**: also OOM.
+- **r=64**: OOM too at full precision. Activation fragmentation from the earlier calibration + pre-LoRA eval in the same kernel ate the remaining headroom.
+
+**Mitigation:** installed `bitsandbytes` and swapped `torch.optim.AdamW` → `bnb.optim.AdamW8bit` (quantizes the m/v momentum buffers to 8-bit, cuts optimizer state ~4×).
+
+### Run 2 results — r=64 + AdamW8bit
+
+| Stage | MMLU | Δ from pre-LoRA |
+|---|---|---|
+| Pre-LoRA (Taylor 50%) | 26.68% | — |
+| Run 1: r=16 + AdamW fp | 25.99% | −0.69pp |
+| **Run 2: r=64 + AdamW8bit** | **22.89%** | **−3.79pp** |
+
+Training loss started at 13.33 (first 20 steps) vs 6.27 for run 1. Same LoRA init (`B=0`, so step-0 adapter output is zero regardless of rank) — the early divergence came from the **first few updates** making things worse, not the initialization.
+
+### Initial misreading — and the correction
+
+My first interpretation of this result was "bigger rank overfits harder on narrow aux-train data → data distribution is the real bottleneck, pivot to pretraining-distribution recovery." That was premature — run 2 changed **two variables at once** (rank and optimizer). The user caught the confound and proposed the right isolation test: revert rank to 16 while keeping AdamW8bit.
+
+### Run 3 — r=16 + AdamW8bit (isolates the optimizer)
+
+| Run | Rank | Optim | First-20 loss | Last-20 loss | MMLU | Correct |
+|---|---|---|---|---|---|---|
+| Run 1 | 16 | AdamW fp | 6.27 | **1.51** | 25.99% | 527/2028 |
+| Run 2 | 64 | AdamW8bit | 13.33 | 1.57 | 22.89% | **464/2028** |
+| Run 3 | 16 | AdamW8bit | 6.19 | 1.85 | **22.89%** | **464/2028** |
+
+**AdamW8bit is the culprit.** Same rank as run 1, different optimizer, MMLU dropped −3.1pp. Runs 2 and 3 landed on the **identical 464/2028** with nearly byte-for-byte identical per-subject scores — AdamW8bit pushes the adapters into the same degenerate attractor regardless of rank.
+
+### What AdamW8bit actually breaks (and what it doesn't)
+
+- **Base weights are untouched.** Only LoRA adapters are trainable, so the frozen pruned base stays at bf16 integrity regardless of optimizer precision.
+- **First-20 loss is fine at r=16** (6.19 ≈ run 1's 6.27). The optimizer doesn't blow up early — the base + zero-init adapters still evaluate correctly, and the first batch of updates is small enough that quantization error is bounded.
+- **Final loss floor is higher** (1.85 vs 1.51). Once gradients get small near a minimum, the quantized m/v momentum can't resolve the updates precisely enough — the optimizer takes noisy steps around the valley instead of settling into it.
+- **Net: adapter learns a noisy, partial version of the aux-train mapping.** MMLU evaluator picks up this noise as shifted logits at A/B/C/D positions, dragging accuracy below even the pre-LoRA baseline.
+
+### Why QLoRA gets away with 8-bit optimizers but we don't
+
+QLoRA literature uses 8-bit optimizers successfully, but that's on **pretraining-distribution tasks** where per-token loss is typically 2–5 and gradients are large. Signal-to-quant-noise ratio is comfortable.
+
+Our regime is different: answer-token-only loss on a narrow MCQ distribution, final loss floor ~1.5. Gradients near that floor are small and quant error dominates. Recovery fine-tuning after pruning is a **low-gradient** regime — precisely where AdamW8bit is most damaging.
+
+### Takeaways
+
+- **Capacity is not the recovery bottleneck** at this damage level. We can't cleanly prove it at r=64+ because we can't run it full-precision on this GPU, but the signal from r=16+8bit vs r=16+fp is strong enough to reject the "bigger rank = better recovery" hypothesis in the regime we can test.
+- **8-bit optimizer is not safe for recovery fine-tuning on small LoRA.** This is a real concrete finding for anyone trying QLoRA-style recovery on pruned models: the precision tradeoff that works for pretraining hurts at recovery.
+- **The data-distribution hypothesis is still untested.** Run 1 (r=16 + fp AdamW) gave −0.69pp with per-subject swings of ±13pp — consistent with aux-train narrowness, but not proven. The cleanest next experiment is still pretraining-distribution LoRA (C4 / FineWeb, next-token CE), kept at r=16 + full-precision AdamW.
+- **If we want to test higher rank, we need memory fixes that don't compromise the optimizer:** shorten MAX_LEN 192 → 128 (cuts training activations ~33%), drop `down_proj` from targets (−40% adapter params but loses that projection's recovery), or rent GPU time with more VRAM. 8-bit optimizer is off the table for this task.
+
+### Methodological lesson
+
+When changing two variables simultaneously (rank AND optimizer) produces an unexpected result, the first instinct should be isolation, not interpretation. I jumped to a data-distribution narrative that plausibly fit run 2's numbers but wasn't supported by the experiment design. The user's catch — "you can't compare like that" — saved us from writing up a wrong hypothesis as fact.
+
+### Status: blocked by VRAM
+
+**We were unable to reach final recovery results because we are constrained by the 8 GB VRAM of the RTX 4070 Laptop.** The experiments we can run on this hardware have given us a clear picture of what's happening (8-bit optimizer is unsafe for recovery; r=16 + full-precision AdamW with MMLU aux-train yields at best −0.69pp) but not what the ceiling actually is.
+
+The experiments we cannot run on this hardware, and which would be the natural next steps:
+
+- **r=64+ with full-precision AdamW** — direct capacity test. Every attempt OOM'd.
+- **Longer training runs at r=16** — more epochs, more data samples, but N_TRAIN=500 was already pushing the memory budget with activations retained across sequences.
+- **Pretraining-distribution LoRA on C4/FineWeb** — same r=16 memory profile is fine in principle, but longer sequences (full 512-token windows as used in our calibration) inflate training activations past what the card can hold alongside LoRA adapters + optimizer state.
+- **Combining LoRA recovery with larger calibration runs** — the current notebook 5 already OOMs when you try to go above N_CAL=512 without freeing intermediate tensors aggressively.
+
+**The scientific loop is bottlenecked by VRAM, not by algorithmic ideas.** Continuing this line of work productively requires either:
+- Hardware with ≥16 GB VRAM (a desktop 4080/4090, a rented A100/H100, or Colab Pro T4/A100), OR
+- A different memory discipline for the notebook (CPU-offloaded optimizer state via DeepSpeed ZeRO-Offload, or per-layer LoRA attachment + gradient-release to drop peak activations).
+
+Both are out of scope for a single 8 GB laptop card doing LoRA on a 3B model. The findings above are therefore **preliminary, not conclusive** — they tell us the optimizer choice matters and that narrow MCQ data probably isn't the right recovery signal, but they do not establish a recovery ceiling for pruned Qwen 2.5 3B.

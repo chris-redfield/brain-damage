@@ -21,26 +21,18 @@ The matrix stays the same shape, and GPUs can't skip the zeroed ops — you get 
 
 ## Baseline Results
 
-Model: `google/gemma-3-1b-pt` (bf16, RTX 4070 Laptop 8GB)
+Model: `google/gemma-3-1b-it` (instruction-tuned, bf16, RTX 4070 Laptop 8GB)
 
-| Subject | Accuracy |
+| Metric | Accuracy |
 |---|---|
-| abstract_algebra | 26.0% (26/100) |
-| anatomy | 17.0% (23/135) |
-| college_chemistry | 24.0% (24/100) |
-| college_computer_science | 28.0% (28/100) |
-| econometrics | 22.8% (26/114) |
-| global_facts | 31.0% (31/100) |
-| machine_learning | 25.0% (28/112) |
-| moral_scenarios | 24.7% (221/895) |
-| professional_medicine | 20.2% (55/272) |
-| us_foreign_policy | 21.0% (21/100) |
-| **OVERALL** | **23.8% (483/2028)** |
+| **OVERALL** | **30.8% (624/2028)** |
 
-> This is roughly random-chance level (25% for 4-choice), which is expected
-> for a 1B pretrained (non-instruct) model on MMLU. The value is as a
-> reference point — we measure how much pruning degrades from here and
-> whether duplication can push above it.
+> The pretrained variant (`gemma-3-1b-pt`) scored 23.8% — random chance level,
+> unusable for measuring pruning degradation. The instruction-tuned model gives
+> a clear signal above random (25%), making pruning impact measurable.
+>
+> Best pruning result so far: **Gradient (Taylor) at 20% → 28.3%** (only -2.5pp
+> from baseline).
 
 ---
 
