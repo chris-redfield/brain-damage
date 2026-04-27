@@ -1,0 +1,81 @@
+{
+  "model": "Qwen/Qwen2.5-3B-Instruct",
+  "hparams": {
+    "r": 16,
+    "alpha": 32,
+    "T": 2.0,
+    "distill_alpha": 0.5,
+    "epochs": 3,
+    "lr": 0.0001,
+    "max_train_len": 320
+  },
+  "dense_refs": {
+    "conll_dev_ppl": 1.7254177775944626,
+    "conll_dev_f1": 0.6144,
+    "mmlu_acc": 0.487
+  },
+  "sweep": {
+    "taylor_20": {
+      "sparsity": 0.2,
+      "pre_distill": {
+        "conll_dev_ppl": 5.788665991045695,
+        "conll_dev_nll": 1.7559018662558998,
+        "conll_dev_f1": 0.0970873786407767,
+        "conll_dev_p": 0.09925558312655088,
+        "conll_dev_r": 0.09501187648456057
+      },
+      "training": {
+        "steps": 1497,
+        "time_s": 285.8984172344208,
+        "first50_total": 1.907283884882927,
+        "last50_total": 0.38847880423069,
+        "first50_ce": 1.1675850701855461,
+        "last50_ce": 0.1940275184166967,
+        "first50_kl": 2.6469827163219453,
+        "last50_kl": 0.5829300886392593
+      },
+      "post_distill": {
+        "conll_dev_ppl": 1.4145243868505526,
+        "conll_dev_nll": 0.3467933522263161,
+        "conll_dev_f1": 0.4711388455538221,
+        "conll_dev_p": 0.6863636363636364,
+        "conll_dev_r": 0.3586698337292161,
+        "conll_test_f1": 0.3155216284987277,
+        "conll_test_p": 0.6966292134831461,
+        "conll_test_r": 0.20394736842105263,
+        "mmlu_acc": 0.2668
+      }
+    },
+    "taylor_50": {
+      "sparsity": 0.5,
+      "pre_distill": {
+        "conll_dev_ppl": 853.8668531713574,
+        "conll_dev_nll": 6.749775271997986,
+        "conll_dev_f1": 0.0,
+        "conll_dev_p": 0.0,
+        "conll_dev_r": 0.0
+      },
+      "training": {
+        "steps": 1497,
+        "time_s": 281.0720353126526,
+        "first50_total": 7.892823884487152,
+        "last50_total": 0.8009444165974855,
+        "first50_ce": 3.603360877679661,
+        "last50_ce": 0.3678774116499699,
+        "first50_kl": 12.182286882400513,
+        "last50_kl": 1.2340114125609398
+      },
+      "post_distill": {
+        "conll_dev_ppl": 1.7143801812096788,
+        "conll_dev_nll": 0.5390516049200693,
+        "conll_dev_f1": 0.3367496339677892,
+        "conll_dev_p": 0.4389312977099237,
+        "conll_dev_r": 0.27315914489311166,
+        "conll_test_f1": 0.3238512035010941,
+        "conll_test_p": 0.48366013071895425,
+        "conll_test_r": 0.24342105263157895,
+        "mmlu_acc": 0.2559
+      }
+    }
+  }
+}

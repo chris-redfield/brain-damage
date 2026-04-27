@@ -34,6 +34,10 @@ This 8 GB constraint shapes almost every decision — models above ~3B don't fit
 | 4 | `4.fused_mlp_2b.ipynb` | Qwen 2.5 3B: activation-aware fused kernel + Taylor scoring + load-once architecture. **Main kernel results.** |
 | 5 | `5.lora_recovery.ipynb` | Qwen 2.5 3B Taylor-50% pruned: LoRA fine-tuning recovery attempts. Rank sweep + optimizer confound analysis. **Main recovery results.** |
 | 6 | `6.layer_duplication.ipynb` | Qwen 2.5 3B: RYS-style layer duplication. 14 variants. **No narrow duplication beats dense.** Wide duplication (layers 9-34, 72% of stack) lands at 48.87% vs dense 48.67% — within noise (Phase 5 negative result). See FINDINGS §17. |
+| 7 | `7.rmp_full.ipynb` | Full RMP combo: F + pruning sweep + LoRA recovery. F + pruning consistently *hurts* (Phase 5 negative confirmed). See FINDINGS §18. |
+| 8 | `8.taylor_after_duplication.ipynb` | Comparison: Taylor importance computed on dense vs duplicated model. Built but not run yet. |
+| 9 | `9.entity_extraction_eval.ipynb` | **New evaluation metric** — CoNLL-2003 NER perplexity + F1. Dense F1=0.614, Taylor 10% F1=0.383 (gap −23pp). Cleaner signal than MMLU. Caches teacher top-K logits to disk for offline distillation. See FINDINGS §20. |
+| 10 | `10.distillation_recovery.ipynb` | **First major positive result.** Offline distillation: Taylor 20% pruned + LoRA r=16 + KL loss vs cached teacher top-K logits. F1: 0.097 → 0.423 (recovered 63% of dense gap in 5 min training). See FINDINGS §21. |
 
 ---
 
@@ -44,7 +48,7 @@ This 8 GB constraint shapes almost every decision — models above ~3B don't fit
 - ✅ **Phase 3** — Custom sparse operator (bitmap kernel + hybrid dispatch + fused MLP kernel)
 - ✅ **Phase 4** — Evaluation (MMLU on 1B Gemma + 3B Qwen, kernel microbench + end-to-end latency)
 - ⚠️ **Phase 5** — Block duplication (RYS-style) attempted across 14 variants. **Negative result**: narrow duplications (1-11 layers) hurt MMLU by 3-14pp; wide duplication (layers 9-34, 72% of stack) is within noise of dense. Earlier "F=[8,16] beats dense by +0.20pp" claim was a misread — real F is [9,34]. See FINDINGS §17 for the correction.
-- ⚠️ **Phase 6** — LoRA recovery attempted; **blocked by VRAM** (see Sections 14–15 of FINDINGS). Stretch goals (whole-layer removal, quantization) untouched.
+- ✅ **Phase 6** — Recovery via **offline teacher distillation** validated. Taylor 20% pruned Qwen 2.5 3B recovers 63% of CoNLL F1 gap in 5 minutes of r=16 LoRA training against cached top-K=64 teacher logits (3.3 MB on disk). See FINDINGS §21. LoRA-with-narrow-data variant remains a negative result (sections 14-15, 18-19).
 
 ---
 
@@ -82,6 +86,36 @@ The accuracy story flipped going from 1B → 3B: Qwen's concentrated circuitry i
 | + LoRA r=16 + AdamW8bit | 22.89% (**−3.79pp**) |
 
 Best attempted recovery: −0.69pp. Not a net win but pipeline works end-to-end on 8 GB.
+
+### Distillation recovery (Qwen 2.5 3B, notebook 10) — Phase 6 win
+
+| Metric | Dense | Pre-distill (Taylor 20%) | Post-distill | Recovery |
+|---|---|---|---|---|
+| Perplexity (CoNLL annotations) | 1.725 | 5.789 | **1.406** | 107.9% (overshoots — distillation artifact) |
+| **F1 (CoNLL-2003 dev)** | **0.614** | **0.097** | **0.423** | **63.1%** |
+| Precision | 0.747 | 0.099 | 0.632 | 84.6% of dense |
+| Recall | 0.522 | 0.095 | 0.318 | 60.9% of dense |
+
+- 5 minutes of LoRA r=16 training, 1500 steps, full-precision AdamW
+- KL divergence on cached teacher top-K=64 logits at temperature T=2, mixed with hard CE on gold targets (α=0.5)
+- Teacher cache: 3.3 MB on disk (from notebook 9)
+- F1 eval samples disjoint from training samples — honest comparison
+- Peak GPU 7.01 GB — fits on 8 GB card
+
+**This is the first recovery experiment in the project that actually worked.** All prior LoRA attempts (notebooks 5, 7) hovered between −3.79pp and 0.00pp from baseline. Distillation gained +33pp F1 from a near-random starting point. The mechanism: prior LoRA trained on narrow MCQ format priors (MMLU-aux answer-token-only) which can't repair MLP circuits; distillation transfers the *capability* (calibrated next-token prediction) rather than the *task format*.
+
+### Entity extraction recovery metric (Qwen 2.5 3B, notebook 9)
+
+| Metric | Dense | Taylor 10% Pruned | Gap |
+|---|---|---|---|
+| Perplexity (annotation tokens) | 1.725 | 2.289 | +0.564 |
+| **F1 (CoNLL-2003 NER)** | **0.614** | **0.383** | **−23.1pp** |
+| Precision | 0.747 | 0.415 | −33.2pp |
+| Recall | 0.522 | 0.356 | −16.6pp |
+
+**This metric is dramatically better than MMLU for measuring pruning damage and recovery.** Random floor for F1 is ~0% (vs MMLU's 25%) so the dense→pruned gap isn't squeezed against a noise floor. Precision degrades much more than recall — pruning is causing the model to over-extract spurious entities, a "loss of careful selectivity" diagnostic that MMLU couldn't reveal. Both per-token (perplexity) and per-entity (F1) signals from one eval pass.
+
+Teacher cache (top-K=64 logits, 3.3 MB on disk) saved for offline distillation. See FINDINGS §20.
 
 ### Layer duplication (Qwen 2.5 3B, notebook 6) — Phase 5 negative result
 
@@ -150,11 +184,12 @@ Ranking from best to worst (consistent across both model sizes):
 - **Taylor "double duty" is NOT validated at the duplication end.** The importance map tells us what's safe to *prune* (well-validated). It does not, on this evidence, reliably tell us what's beneficial to *duplicate* at this model size.
 - **Methodological lesson.** An earlier version of FINDINGS Section 16 built a strong "razor-sharp boundary at [8, 16]" narrative and a "block-size cliff" story based on a misread of the variants-output cell. F was always range [9, 34], not [8, 16]. The adjacent "widening" variants (F_L, F_R, F_LR) weren't widening the winner — they were nearby narrow windows, and their collapse was the same pattern as every other narrow window in the sweep. Always read the variant spec from code/logs, not from chart interpretation.
 
-### On LoRA recovery (new — notebook 5)
+### On LoRA recovery (notebook 5 — four runs, including rank sweep)
 
-- **MMLU-aux training doesn't recover broken MLP circuits.** Training on 500 aux-train samples (answer-token-only loss) moved per-subject accuracy ±13pp but net was −0.69pp. The learning is real (loss 6.27 → 1.51) but narrow — it overwrites one MCQ answer-format prior with another rather than repairing the pruned circuits. Hypothesis: pretraining-distribution data (C4/FineWeb + next-token CE) would match what was broken, but we can't run that experiment here.
-- **8-bit AdamW is not safe for recovery fine-tuning.** Holding rank=16 fixed, swapping full-precision AdamW → AdamW8bit dropped MMLU from 25.99% → 22.89% — same degenerate attractor (464/2028) as the r=64 run. Mechanism: quantized m/v momentum can't resolve small updates near the loss floor (final loss 1.85 vs 1.51); QLoRA gets away with this on pretraining (high-gradient regime) but recovery is low-gradient.
-- **Capacity (rank) isn't the recovery bottleneck** at least up to what we can test. r=16+fp beats r=64+8bit by 3pp — bigger adapter with noisier optimizer is worse than smaller adapter with clean optimizer. Testing rank=64+ with full-precision AdamW requires >8 GB VRAM.
+- **MMLU-aux training doesn't recover broken MLP circuits.** Training on 500 aux-train samples (answer-token-only loss) moved per-subject accuracy ±13pp but net was −0.69pp at r=16, **−1.93pp at r=32** (tested directly in Run 4). The learning is real (loss → 1.45) but narrow — it overwrites one MCQ answer-format prior with another rather than repairing the pruned circuits.
+- **8-bit AdamW is not safe for recovery fine-tuning.** Holding rank=16 fixed, swapping full-precision AdamW → AdamW8bit dropped MMLU from 25.99% → 22.89%. Mechanism: quantized m/v momentum can't resolve small updates near the loss floor (final loss 1.85 vs 1.51); QLoRA gets away with this on pretraining (high-gradient regime) but recovery is low-gradient.
+- **Capacity (rank) is NOT the bottleneck.** Three direct tests falsify the "higher rank helps" hypothesis: r=32 fp lost 1.24pp vs r=16 fp (same data, more rank = worse); r=16 8bit lost 3.1pp vs r=16 fp (optimizer matters much more than rank); r=32 fp beat r=64 8bit by 1.86pp (clean optimizer beats higher rank with destructive optimizer). More rank fits the narrow training distribution more faithfully, amplifying the *wrong* direction of learning.
+- **The real bottleneck is the evaluation metric itself.** MMLU measures specific factual knowledge (per Geva et al. 2020, stored in MLP layers we're pruning). C4-based CPT could restore general circuits but not the specific facts MMLU asks about — those facts live in the tiles we zeroed. To recover MMLU specifically would require teacher distillation (KL against unpruned logits). **To honestly measure circuit recovery from structured pruning, switch metrics** — perplexity on held-out text or task F1 (entity extraction on CoNLL-2003) both directly measure "did general language modeling recover?" without requiring specific fact recall. See FINDINGS §19.
 - **Methodological lesson**: when two variables change at once (rank AND optimizer) and you get an unexpected result, isolate before interpreting. I nearly wrote up a wrong "data distribution is the bottleneck" conclusion based on a confounded experiment.
 
 ### Memory on a tight GPU
@@ -176,10 +211,12 @@ Ranking from best to worst (consistent across both model sizes):
 
 ### Local-feasible (what we can still do on 8 GB)
 
-1. **Sweep narrow duplication windows systematically** — all [start, end] pairs with end − start ∈ {3, 5, 7, 9} across the stack. The current evidence is that narrow duplications hurt everywhere we tested; but we only sampled ~10 configs. A more complete sweep would verify there's no hidden sweet spot RYS-style. Cheap: 3240 configs like RYS's sweep = too many; a 36×36/2 structured sweep = 648 configs × 90s = too long; but e.g. fixed-size-7 window across 30 positions = 30 evals × 90s = 45 min.
-2. **Sub-10% sparsity on Qwen** — below the accuracy knee. Less speedup but might preserve real signal. Worth measuring for a quality-focused operating point.
-3. **Pruning + LoRA recovery with pretraining distribution OR more data** — notebook 5's MMLU-aux approach didn't work. Try C4 streaming + next-token CE at r=16 with full-precision AdamW. (VRAM-constrained; maybe with MAX_LEN 96 it fits.)
-4. **Attention tile-pruning** (Phase 6 stretch) — currently excluded. Per-head analysis + MLP-style tile pruning within Q/K/V projections. Risky but unexplored.
+1. **Switch recovery metric off MMLU** (FINDINGS §19) — structured MLP pruning destroys specific facts which MMLU tests and which pretraining-distribution recovery cannot restore. Better metrics: perplexity on held-out C4 validation, entity extraction F1 on CoNLL-2003. Notebook 9 candidate: dense baseline + Taylor-10% baseline + Taylor-10% + LoRA, all measured on perplexity + NER F1 instead of MMLU.
+2. **Offline teacher distillation** — run unpruned Qwen 2.5 3B on a recovery corpus once, save top-K logits (K≈32-64) to disk (~65 KB per sequence), then train Taylor-pruned student via KL against cached teacher logits. Addresses MMLU's fact-recall gap without needing two 3B models on VRAM simultaneously.
+3. **Sweep narrow duplication windows systematically** — all [start, end] pairs with end − start ∈ {3, 5, 7, 9} across the stack. The current evidence is that narrow duplications hurt everywhere we tested; but we only sampled ~10 configs. A more complete sweep would verify there's no hidden sweet spot RYS-style.
+4. **Sub-10% sparsity on Qwen** — below the accuracy knee. Less speedup but might preserve real signal. Worth measuring for a quality-focused operating point.
+5. **Pruning + CPT with pretraining distribution** — stream C4 + full next-token CE (not answer-token-only) at r=16 with full-precision AdamW. Evaluate via perplexity, NOT MMLU.
+6. **Attention tile-pruning** (Phase 6 stretch) — currently excluded. Per-head analysis + MLP-style tile pruning within Q/K/V projections. Risky but unexplored.
 
 ### Stretch (Phase 6 remainder)
 

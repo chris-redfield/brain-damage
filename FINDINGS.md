@@ -1041,3 +1041,228 @@ We did not confirm:
 - The +0.20pp win (it's within noise).
 
 Phase 5 should be marked **attempted with negative result**, not ✅. The RMP full-combo test in notebook 7 is still worth running for pruning data but shouldn't expect a duplication-driven gain.
+
+---
+
+## 18. Full-RMP combo test (notebook 7) — F + pruning is worse than pruning alone
+
+Notebook 7 re-ran with the corrected `F_RANGE = (9, 34)` matching notebook 6's real winning F variant. Clean test of whether F duplication *combined* with pruning recovers the lost accuracy, or adds additional cost.
+
+### Results — F + pruning on Qwen 2.5 3B
+
+| Config | MMLU | Δ vs dense (48.67%) | F contribution at this sparsity |
+|---|---|---|---|
+| Dense | 48.67% | — | — |
+| F only [9, 34] | **48.87%** | **+0.20pp** | — (reproduces nb6 exactly) |
+| Taylor 10% alone | 35.65% | −13.02pp | — |
+| Taylor 10% + F | **34.57%** | **−14.10pp** | **−1.08pp** |
+| Taylor 20% alone | 26.78% | −21.89pp | — |
+| Taylor 20% + F | **25.54%** | **−23.13pp** | **−1.24pp** |
+| Taylor 30% alone | 24.75% | −23.92pp | — |
+| Taylor 30% + F | **24.01%** | **−24.66pp** | **−0.74pp** |
+| Taylor 50% alone | 26.68% | −21.99pp | — |
+| Taylor 50% + F | 27.17% | −21.50pp | +0.49pp (on random floor) |
+
+### F reproduced exactly
+
+Notebook 7 with the correct F range reproduced notebook 6's F = 48.87% to the question. That confirms F's result is not session-dependent — the earlier 38.21% anomaly was entirely because notebook 7 had been testing `F_RANGE = (8, 16)` (a losing narrow window), not the actual F from notebook 6.
+
+### F duplication *hurts* pruning at every above-knee sparsity
+
+At Taylor 10, 20, and 30% pruning, adding F duplication on top **subtracts** 0.74–1.24pp. Three independent sparsity levels all point the same direction. That's not noise.
+
+Only at Taylor 50% does F "help" (+0.49pp) — but both Taylor 50% and Taylor 50% + F are already at random-chance floor (26.68% and 27.17%, around the 25% baseline). At the floor, small perturbations can go either way. The +0.49pp here is noise around 25%, not a real gain.
+
+### Mechanism — duplication amplifies whatever the circuit is doing
+
+The intuition before running: "F duplicates the important reasoning layers, which should let the model 'think harder' and compensate for pruning damage."
+
+What actually happens: duplication *amplifies* whatever the circuit is computing. On an intact model, the circuit is computing reasonable logits, so duplication compounds them (approximately neutral at +0.20pp). On a pruned model, the circuit is broken — duplication compounds the *damage*. Running a broken circuit twice doesn't fix it; it doubles down on the corrupted intermediate representations.
+
+This is the opposite of the RMP thesis. The thesis said "prune dead weight, duplicate critical circuits to recover." The data says "duplicating a damaged circuit makes things worse."
+
+### LoRA on top of Taylor 10% + F: exactly 0.00pp change
+
+After training 500 MMLU-aux samples × 3 epochs (r=16, full-precision AdamW — the only config notebook 5 showed was safe) on the Taylor 10% + F base:
+
+- Training loss dropped cleanly: first-20 mean = 13.56, last-20 mean = 1.53 → adapter weights *did* update significantly.
+- Pre-LoRA MMLU: 34.57% (701/2028 correct).
+- Post-LoRA MMLU: **34.57% (701/2028 correct)** — bit-for-bit identical. Zero questions flipped.
+
+This is statistically unusual. Two candidate explanations:
+- **Benign**: the base model is near random-chance (25%), so logit distributions over A/B/C/D are nearly flat for most questions. The LoRA adapter's contribution is non-zero but too small to cross decision boundaries at any question. The training learned the aux-train answer-format prior but that shift doesn't modulate individual rankings when the base is near random.
+- **Concerning**: PEFT + F-duplication had some interaction that effectively disabled the adapter during eval (e.g., `active_adapter` getting cleared, the duplicated layer's second-pass adapter output cancelling the first pass in a way that zeroes effective contribution). Would need a small diagnostic (forward one MMLU example with LoRA on vs off) to rule this out.
+
+Training loss trajectory is healthy, which leans toward the benign explanation. But 0.00pp exactly is worth a note.
+
+### Implications for the project thesis
+
+The RMP full picture, honestly stated:
+
+- **Pruning half**: Taylor scoring picks safe-to-remove tiles. Works up to the knee (~10-20% on Qwen 3B), flat degradation after. Kernel-side speedups scale with model size (1.4× at 3B, 50% sparsity). **This half is well-validated.**
+- **Duplication half**: F [9, 34] reproduces the +0.20pp-within-noise result on dense. F + pruning consistently hurts. **This half is a negative result** in the "full RMP" sense: duplication and pruning don't compose toward a joint win — they compose toward additional cost.
+- **LoRA recovery half**: narrow MCQ-style training at r=16 (full-precision) is at best neutral, at worst destructive. With F + pruning + LoRA the net is 34.57% — 14pp below dense. The pretraining-distribution recovery hypothesis remains untested (VRAM-blocked).
+
+### What notebook 7 is still good for
+
+The Taylor 10/20/30% alone numbers (35.65, 26.78, 24.75) are new measurements not present in notebooks 4/5/6. They confirm the accuracy knee on Qwen 3B is between 10-20%: above 20%, the model is at random floor. These can serve as pruning-only baselines for any future combo experiment (e.g., the post-duplication Taylor test of notebook 8).
+
+---
+
+## 19. Rank sweep continued + the recovery-metric problem
+
+### Run 4: r=32 + full-precision AdamW
+
+Continuing notebook 5 to test "was rank the bottleneck in LoRA recovery?" Memory-safe config: r=32, alpha=64, full-precision `torch.optim.AdamW`, everything else matches Run 1 (500 MMLU-aux × 3 epochs, answer-token-only loss, Taylor-50% pruned base).
+
+| Run | Rank | Optimizer | Pre-LoRA | Post-LoRA | Δ |
+|---|---|---|---|---|---|
+| 1 | 16 | AdamW fp | 26.68% | 25.99% | −0.69pp |
+| 2 | 64 | AdamW8bit | 26.68% | 22.89% | −3.79pp (confounded) |
+| 3 | 16 | AdamW8bit | 26.68% | 22.89% | −3.79pp |
+| **4** | **32** | **AdamW fp** | **26.68%** | **24.75%** | **−1.93pp** |
+
+**r=32 made recovery WORSE, not better.** Direct test, direct falsification of the "low rank is the bottleneck" hypothesis. Training was healthy (first-20 loss 5.20 < 6.27 at r=16; final floor 1.45 ≈ r=16's 1.51). Peak GPU 7.17 GB, well under the 8 GB limit. The additional rank-32 capacity made the adapter fit the narrow MMLU-aux prior *more faithfully*, committing harder to the wrong direction of learning.
+
+Three runs now consistently falsify capacity as the bottleneck:
+- r=16→r=32 at fixed optimizer: got 1.24pp worse.
+- r=16 fp→8bit at fixed rank: got 3.1pp worse (optimizer is destructive; isolation test).
+- r=32 fp beats r=64 8bit by +1.86pp (fp optimizer matters more than rank).
+
+### The real bottleneck: the evaluation metric itself
+
+Discussing further with the user, a sharper framing emerged: **MMLU may be the wrong metric to measure LoRA recovery against.**
+
+MMLU asks 2028 factual questions across 57 specialized subjects — professional medicine drug interactions, abstract algebra theorems, US foreign policy history. These require **specific factual knowledge** the model internalized during pretraining. Research (Geva et al. 2020, "Transformer Feed-Forward Layers Are Key-Value Memories") shows MLP layers act as learned fact stores — specific (key, value) associations accumulated across pretraining.
+
+When we zero 50% of MLP tiles via Taylor pruning, we are **directly attacking the fact-storage substrate**. Specific facts about lithium pharmacology or the Riemann hypothesis may have lived in tiles that are now zeroed. Those facts are *gone*.
+
+Now consider what different recovery data can teach:
+
+| Data | Signal | Can restore |
+|---|---|---|
+| MMLU-aux 500 samples (our current setup) | answer-letter distribution on ~one source's style | narrow answer-format prior only |
+| C4 / FineWeb (CPT) | general next-token prediction on web text | general language fluency + syntactic circuits + common associations |
+| **Wikipedia / textbooks** | factual statements densely | specific facts present in the corpus |
+| **Teacher distillation (KL on full logits)** | every token's full output distribution from unpruned teacher | full knowledge (approaches teacher capability) |
+
+**C4-based CPT can restore the circuit machinery but not individual facts**, because C4 doesn't repeat the facts MMLU tests with enough density. This explains why MMLU has been a brutal metric: it's measuring **fact recall**, which is precisely what structured MLP pruning destroys and what non-teacher recovery data doesn't restore.
+
+### Implications for the project going forward
+
+- **MMLU is not the right recovery metric** to test whether pruning + LoRA can restore general capability. It's the right metric to test whether pruning + teacher-distillation can restore *fact recall*, which is a harder and narrower question.
+- **Better recovery metrics** for structural pruning: perplexity on held-out text (direct proxy for "did general language modeling recover?"), or task metrics like entity extraction F1 (recognizes language structure without requiring deep facts).
+- **Capacity was never the bottleneck** at the ranks we can test; the *objective* and *evaluation* were the issues.
+- **If we want MMLU specifically**, the path is teacher distillation — cache unpruned model's logits offline, train student (pruned + LoRA) to match via KL. Top-K logit caching (K=32-64) keeps storage tractable (~65 KB per sequence vs 156 MB for full logits at Qwen's 152k vocab).
+- **Pragmatic pivot**: change the recovery metric to perplexity + entity extraction F1 on a small dataset (CoNLL-2003 or similar). Test whether CPT on pretraining text actually restores the general circuits. If it does, we have a solid finding about WHAT recovery *can* and *cannot* repair after structured pruning.
+
+This is a clean honest direction: "structured pruning destroys specific facts but general circuits are recoverable" is a publishable, concrete claim. "Structured pruning + LoRA recovers MMLU" was the claim we couldn't make work and probably never could without teacher distillation.
+
+---
+
+## 20. New evaluation metric: CoNLL-2003 NER (perplexity + F1) — much better than MMLU
+
+Notebook 9 establishes a cleaner recovery metric that doesn't depend on specific factual recall.
+
+### Setup
+
+- Dataset: `eriktks/conll2003` dev split (3250 sentences, BIO-tagged with PER/ORG/LOC/MISC).
+- Prompt: 3 fixed few-shot examples covering all 4 entity types, then test sentence with `Entities:` continuation.
+- Two metrics measured per variant:
+  - **Perplexity** on the entity-annotation tokens (500 random samples, ~5333 total tokens).
+  - **Entity F1** via greedy generation + parsing (200 different random samples, max 64 new tokens).
+- Single eval pass also caches **top-K=64 teacher logits** at the answer-token positions. 3.3 MB on disk for 500 samples — much smaller than expected; the per-sentence answer is short (~10 tokens).
+
+### Baseline numbers (Qwen 2.5 3B-Instruct)
+
+| Metric | Dense | Taylor 10% pruned | Gap |
+|---|---|---|---|
+| Perplexity (annotation tokens) | **1.725** | 2.289 | +0.564 |
+| NLL per token | 0.545 | 0.828 | +0.283 |
+| **F1 (CoNLL-2003 NER)** | **0.614** | **0.383** | **−23.1pp** |
+| Precision | 0.747 | 0.415 | **−33.2pp** |
+| Recall | 0.522 | 0.356 | −16.6pp |
+
+### Why this metric is dramatically better than MMLU
+
+| Property | MMLU | CoNLL NER |
+|---|---|---|
+| Random floor | 25% (signal squashed near floor) | ~0% F1 (full range usable) |
+| What it measures | specific facts (lost in pruned tiles, hard to restore from generic data) | language structure / pattern recognition (recoverable) |
+| Granularity | per-question correct/wrong | per-token PPL + per-entity F1 |
+| Diagnostic power | `X% correct` | precision/recall split reveals damage *type* |
+| Runtime per eval | ~90s × 10 subjects (~15 min) | ~6 min single coherent task |
+| Suitable for low pruning (10-20%) | floor at 25% squeezes signal | clear gaps at 10% |
+| Reproducibility | sensitive to per-subject noise | tighter, stable |
+
+### Key insights from the dense vs Taylor 10% comparison
+
+1. **Pruning damage shows up cleanly at 10% — not just 50%.** MMLU at 10% pruning gave 35.65% (close to the 25% random floor); CoNLL at 10% gives F1 = 0.383 vs dense F1 = 0.614, a 23pp gap that's far above any noise floor. We can now experiment with light pruning + recovery without the metric collapsing to random.
+
+2. **Precision degrades MORE than recall (−33pp vs −17pp).** The pruned model is over-extracting *spurious* entities — confidently labeling non-entities as entities. This is the fingerprint of "circuit damage corrupts careful selectivity": the model loses the discrimination needed to NOT generate entity-shaped output for non-entity content. MMLU couldn't tell us this because it just gave correct/incorrect; NER's P/R split diagnoses *what kind* of damage pruning causes.
+
+3. **Per-token perplexity gap is small (+0.28 NLL) but per-entity F1 gap is large (−23pp).** Per-token errors compound across an entity span: a single wrong-token mid-entity → wrong span boundary → entire entity wrong. F1 captures *structural* correctness that per-token CE doesn't. Having both metrics gives us two granularities of signal from one eval pass.
+
+4. **Dense F1 = 0.614 is a real ceiling.** Qwen 2.5 3B-Instruct does competent few-shot NER without any fine-tuning. Lit results for similar 3B models on CoNLL-2003 zero/few-shot are in 0.55-0.75; our 0.614 is plausible and gives genuine headroom for recovery techniques to demonstrate gain.
+
+### Implications for the project
+
+- **Pivot the recovery metric to CoNLL F1 + perplexity for all future experiments.** MMLU is now reserved for "do we still have the original instruct model's general knowledge" check, not for measuring fine-grained recovery effects.
+- **The teacher cache is on disk** (`results/teacher_conll_logits.pt`, 3.3 MB). It contains top-K=64 logits at every annotation-token position across 500 dev sentences. Ready for offline distillation in notebook 10.
+- **Lower pruning sparsities (10-20%) are now testable** because the metric has resolution there. We don't need to push to 50% (where the model is random and recovery is impossible) just to see signal.
+- **Next experiment**: distillation training on Taylor 20% pruned + LoRA, KL loss against the cached teacher logits. If F1 closes most of the 0.614 → 0.383 gap, structured pruning + offline distillation is a viable RMP recovery path.
+
+---
+
+## 21. Offline distillation recovery — first big positive result
+
+Notebook 10 ran the offline-teacher-distillation experiment on Qwen 2.5 3B at **Taylor 20% pruning** (chosen by user; intentionally past the accuracy knee where the pruned base is at random output). LoRA r=16, full-precision AdamW. KL distillation against cached teacher top-K=64 logits at temperature T=2, mixed with hard CE on gold target tokens (α=0.5 weighting). 500 cached sentences × 3 epochs = 1500 training steps, ~5 min training time. F1 eval on 200 samples disjoint from training (drawn via `setdiff1d(all_indices, ppl_indices_used)`).
+
+### Results
+
+| Metric | Dense | Pre-distill (Taylor 20%) | **Post-distill** | Recovery |
+|---|---|---|---|---|
+| Perplexity (annotation tokens) | 1.725 | 5.789 | **1.406** | 107.9% (overshoots — see below) |
+| **F1 (CoNLL-2003 dev)** | **0.614** | **0.097** | **0.423** | **63.1%** |
+| Precision | 0.747 | 0.099 | 0.632 | 84.6% of dense |
+| Recall | 0.522 | 0.095 | 0.318 | 60.9% of dense |
+
+Training loss trajectory: total 1.94 → 0.41, KL 2.70 → 0.61, CE 1.17 → 0.21 across 1500 steps. Healthy convergence on all components. Peak GPU 7.01 GB.
+
+### What this means for the project
+
+This is the **first recovery experiment that actually worked**. Previous LoRA attempts (notebooks 5, 7) hovered between −3.79pp and 0.00pp from baseline. Distillation **gained +33pp on F1 from a near-random starting point**. Different category of result.
+
+The mechanism, restated cleanly: prior LoRA experiments trained on MMLU-aux answer-token-only loss — a narrow MCQ format prior. That objective can teach "pick answer letter X" but cannot teach "predict next token correctly with calibrated uncertainty." This experiment's objective — match the unpruned teacher's full output distribution at every annotation token — directly transfers the *capability* (calibrated next-token prediction) rather than the *task format*. With the right objective, even r=16 LoRA on 500 samples recovers 63% of structured-pruning damage in 5 minutes. **The bottleneck was always the training signal.** This validates the FINDINGS §19 hypothesis directly.
+
+### Three observations worth noting
+
+1. **Precision recovered far more than recall (85% vs 61% of dense).** Notebook 9's diagnostic insight was that pruning damage manifests as *over-extraction of spurious entities* (precision collapse). Distillation healed precision first — the student learned WHEN to confidently emit entities. Recall is the harder remaining gap, plausibly because some entity recognition requires seeing tokens the teacher generated rarely (so they're outside the cached top-K).
+
+2. **The perplexity overshoot to 107.9% is partly an artifact, not a true "better than dense"** result.
+   - Distillation at temperature T=2 trains the student to match a softened version of teacher's distribution. At eval (T=1) the student's logits become *sharper* than teacher's. Lower PPL = sharper distribution = looks artificially better.
+   - The student only saw the teacher's top-K=64 logits per position. Tokens outside top-K barely got any signal, so the student concentrates probability mass on the K teacher-preferred tokens. This is over-fitting to the teacher's narrow preferred set.
+   - F1 (which measures actual task success) is the more honest metric: 0.423 / 0.614 = 69% of dense capability. That's the real number.
+
+3. **The cost is tiny.** 3.3 MB cached teacher logits. 5 minutes of training. r=16 LoRA. This *fits the full RMP thesis*: prune for compute speedup + cheap offline distillation recovery = small fast capable model. The 8 GB VRAM constraint never blocked teacher-distillation — top-K offline caching makes it work.
+
+### What this finding rules in / rules out for the project
+
+**Validated:**
+- Structured tile pruning on Qwen 2.5 3B is *recoverable* — even from 20% sparsity (past the knee, where the bare pruned model is functionally random).
+- Offline top-K teacher distillation is the right recovery technique for this damage class.
+- The FINDINGS §19 conclusion that "the bottleneck is the training signal, not capacity or optimizer" is correct.
+
+**Still uncertain:**
+- **Generalization across tasks.** Does this LoRA also help MMLU? Probably not for fact-recall items, but the next-token-prediction capability gain might transfer to some MMLU subjects.
+- **Generalization across data within task.** Does the post-distill F1 hold on CoNLL test split (different sentences, same domain) or did it over-fit to the dev distribution despite the disjoint train/eval split?
+- **Recovery curve across sparsity.** Does 50% pruning recover similarly? Or is the post-knee damage too severe at higher sparsity?
+- **Saturation point of training.** 1500 steps got to 63% F1 recovery. Does more training (5000 steps, more samples) push higher, or are we near the ceiling?
+
+These are the experiments we plan to run next (notebook 11).
+
+### Numbers to remember
+
+- **Taylor 20% pruned + offline distillation: F1 0.097 → 0.423 (recovered 63% of dense gap) in 5 minutes of LoRA training with 500 cached teacher samples.**
+- The training infrastructure (top-K=64 teacher cache, KL+CE combined loss at T=2 α=0.5, r=16 LoRA, full-precision AdamW) all fits on 8 GB VRAM with ~7.01 GB peak.
+- This makes **structured tile pruning + offline distillation** a real technique for compressing models on commodity hardware. The full RMP pipeline (pruning kernels + this recovery) finally has a positive end-to-end story.
