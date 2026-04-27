@@ -76,6 +76,20 @@ The big ideas we learned, stated cleanly. For the chronological experiment log s
 
 ---
 
+## 8a. Offline teacher distillation recovers structured-pruning damage at any sparsity tested
+
+**Finding.** Offline knowledge distillation — caching the unpruned teacher's top-K=64 logits at task-relevant positions, then training a pruned student via KL divergence against those cached logits + hard CE on gold targets — recovers most of the F1 gap from structured tile pruning. Validated at Taylor 20% (F1: 0.097 → 0.471, recovered 72.3%) and Taylor 50% (F1: 0.000 → 0.337, recovered 54.8%) on Qwen 2.5 3B with CoNLL-2003 NER. r=16 LoRA, full-precision AdamW, 1500 training steps, 5 minutes per run, 7 GB peak VRAM, 3.3 MB cached teacher data on disk.
+
+**Why it matters.** The constraint that "we can't fit two 3B models on 8 GB VRAM" was never the bottleneck for distillation. Top-K logit caching (1600× smaller than full-vocab logits) makes teacher-student training feasible on commodity hardware. Combined with structured tile pruning (Phase 1-4), this gives a complete pipeline: prune for speed → distill on task-relevant cached logits → recover task capability. End-to-end real on a single 8 GB laptop GPU.
+
+**Generalization rule.** Distillation transfers what the teacher demonstrates in the training data — not general capability. Caching teacher logits over CoNLL annotations recovered NER. **MMLU stayed at random at both 20% and 50% sparsity post-distillation** — the teacher cache contained no facts about chemistry, medicine, etc., so those couldn't transfer. To recover specific factual knowledge requires a knowledge-rich teacher cache (Wikipedia, pretraining text); to recover general fluency requires CPT-style data.
+
+**Counterintuitive sub-finding.** Heavier-pruned + distilled models generalize *better* across data than moderately-pruned ones. Taylor 20% post-distill had a 15.5pp dev-vs-test F1 gap; Taylor 50% had only 1.3pp. At moderate damage the LoRA finds dev-specific patterns to over-fit to; at heavy damage there's no residual base capability to exploit, so the LoRA learns general task structure that generalizes cleanly. The over-fitting risk is highest at moderate damage levels.
+
+**What to take away.** Don't reject teacher distillation because of memory constraints — top-K caching makes it tractable on small VRAM. Match the teacher cache content to the capability you're trying to restore. A single LoRA training run can rescue a model from random-output state given the right signal.
+
+---
+
 ## 8. Narrow layer duplication destroys MMLU; wide duplication is neutral
 
 **Finding (Phase 5 negative result).** Across 13 duplication variants on Qwen 2.5 3B, every narrow duplication (1-11 layers in the circuit region) regressed MMLU by 3-14pp. The only variant that didn't regress — F stitched-top-9 at **26 layers (layers 9-34, 72% of the 36-layer stack)** — landed at 48.87% vs dense 48.67%, which is within the ±1.1pp noise floor.
